@@ -5,7 +5,7 @@ use solana_program::{
 
 use crate::loaders::*;
 
-/// Closes a round account older than ROUND_RETENTION — rent goes to the
+/// Closes a round account older than ROUND_RETENTION; rent goes to the
 /// caller (an incentive to clean up). Unsettled rewards from that round
 /// lapse (settlement treats an empty account as a forfeit).
 pub fn process(accounts: &[AccountInfo]) -> ProgramResult {
@@ -25,7 +25,7 @@ pub fn process(accounts: &[AccountInfo]) -> ProgramResult {
     }
 
     // Zero the data (so the account cannot be "revived" within the same tx)
-    // and move the lamports out — a zero-balance account vanishes after
+    // and move the lamports out; a zero-balance account vanishes after
     // the transaction.
     {
         let mut data = round_info.try_borrow_mut_data()?;

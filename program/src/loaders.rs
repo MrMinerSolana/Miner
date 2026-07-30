@@ -2,7 +2,7 @@
 //!
 //! Program accounts (Config/Round/Miner) are validated via
 //! owner == program + discriminator + identity fields (index / authority),
-//! without re-deriving PDAs in the hot path — only this program could have
+//! without re-deriving PDAs in the hot path, since only this program could have
 //! created an account with that discriminator, and it only ever creates
 //! them at the canonical PDA.
 
@@ -153,7 +153,7 @@ pub fn settle_previous_round(
         return Ok(());
     }
     if prev_round_info.data_is_empty() {
-        // Round account closed after retention — the reward lapses.
+        // Round account closed after retention: the reward lapses.
         if miner.last_round.saturating_add(ROUND_RETENTION) <= current_round {
             miner.last_round_weight = 0;
             return Ok(());

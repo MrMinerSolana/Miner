@@ -6,7 +6,7 @@ use solana_program::{
 
 use crate::loaders::*;
 
-/// Permissionless crank: closes the current round (implicitly — it stops
+/// Permissionless crank: closes the current round (implicitly, in that it stops
 /// being current) and opens the next one. Anyone can call it; the caller
 /// pays rent for the new round account and recovers it after retention
 /// via close_round.

@@ -6,7 +6,7 @@ use solana_program::{
 use crate::loaders::*;
 
 /// Admin parameter change: min_difficulty, base_weight and round_seconds
-/// (round cadence — the budget scales pro-rata, so emission per minute
+/// (round cadence; the budget scales pro-rata, so emission per minute
 /// stays constant; takes effect from the next round).
 pub fn process(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let [admin_info, config_info] = accounts else {
@@ -23,7 +23,7 @@ pub fn process(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let base_weight = u64::from_le_bytes(data[8..16].try_into().unwrap());
     let round_seconds = u64::from_le_bytes(data[16..24].try_into().unwrap());
 
-    // Sanity: difficulty within a sane range (capped at 32 — beyond that
+    // Sanity: difficulty within a sane range (capped at 32; beyond that
     // even strong hardware cannot finish within a round, i.e. the admin
     // could freeze mining), non-zero base, cadence within allowed bounds.
     if min_difficulty > 32

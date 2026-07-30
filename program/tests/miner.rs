@@ -47,7 +47,7 @@ fn setup() -> (LiteSVM, Keypair, Pubkey) {
     )
     .expect("initialize");
 
-    // Production difficulty (20 bits) is ~1M hashes — that would take ages
+    // Production difficulty (20 bits) is ~1M hashes; that would take ages
     // on the host in debug mode, so tests grind at difficulty 8.
     send(
         &mut svm,
@@ -229,7 +229,7 @@ fn test_free_tier_full_flow() {
     assert_eq!(round0.total_weight, INITIAL_BASE_WEIGHT);
 
     // New round; the next submit settles the previous one (100% of the
-    // budget — mining solo).
+    // budget, mining solo).
     advance_round(&mut svm, &admin);
     mine(&mut svm, &miner_kp, &mint).expect("mine r1");
     let m = get_miner(&svm, &miner_kp.pubkey());
@@ -502,7 +502,7 @@ fn test_empty_round_emission_lapses() {
     advance_round(&mut svm, &admin);
     advance_round(&mut svm, &admin);
 
-    // The miner only mines in round 2 — nothing from the empty rounds.
+    // The miner only mines in round 2, so nothing from the empty rounds.
     mine(&mut svm, &miner_kp, &mint).expect("mine r2");
     let m = get_miner(&svm, &miner_kp.pubkey());
     assert_eq!(m.pending_rewards, 0);
@@ -524,8 +524,8 @@ fn test_set_admin_rotates_authority() {
     .expect("set_admin");
     assert_eq!(get_config(&svm).admin, new_admin.pubkey().to_bytes());
 
-    // The old admin loses access — both to the config and further rotations.
-    // (difficulty 10, not 8 — a tx identical to setup() would be deduplicated)
+    // The old admin loses access, both to the config and further rotations.
+    // (difficulty 10, not 8: a tx identical to setup() would be deduplicated)
     let err = send(
         &mut svm,
         &[sdk::update_config(
@@ -580,7 +580,7 @@ fn test_set_admin_rejects_non_admin_and_zero_key() {
     .expect_err("a non-admin must be rejected");
     assert!(err.contains("Custom(3)"), "expected Unauthorized: {err}");
 
-    // The all-zero address is rejected — protects against accidentally
+    // The all-zero address is rejected; protects against accidentally
     // "burning" the role.
     let err = send(
         &mut svm,
@@ -596,7 +596,7 @@ fn test_set_admin_rejects_non_admin_and_zero_key() {
 fn test_update_config_difficulty_cap() {
     let (mut svm, admin, _mint) = setup();
 
-    // 33 bits exceeds the cap (the admin could freeze mining) — rejected.
+    // 33 bits exceeds the cap (the admin could freeze mining): rejected.
     let err = send(
         &mut svm,
         &[sdk::update_config(
@@ -611,7 +611,7 @@ fn test_update_config_difficulty_cap() {
     .expect_err("difficulty 33 must be rejected");
     assert!(err.contains("InvalidInstructionData"), "{err}");
 
-    // 32 bits is the maximum — passes.
+    // 32 bits is the maximum: passes.
     send(
         &mut svm,
         &[sdk::update_config(

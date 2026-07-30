@@ -14,9 +14,9 @@ Website & web miner: [miner.tools](https://miner.tools)
 | Treasury PDA (mint authority) | `7dPJNrgvYr1zSro9kztPhcjNN8ZE5z4cHYRJohQJtjkd` |
 | Squads multisig vault (admin + upgrade authority, 2-of-3, 2h timelock) | `2eiusJRgWkTrNUBau6wCFYLUYXWHhCYhUsofPVFJ6EWj` |
 
-The mint authority is a program PDA — nobody can mint outside the algorithm.
+The mint authority is a program PDA, so nobody can mint outside the algorithm.
 Admin can only tune bounded parameters (difficulty ≤ 32 bits, round length
-10 s – 1 h, base weight > 0), gated by a 2-of-3 multisig with a 2-hour
+10 s to 1 h, base weight > 0), gated by a 2-of-3 multisig with a 2-hour
 timelock.
 
 ## Mine from the CLI
@@ -36,10 +36,10 @@ miner crank    # optional: run the permissionless round crank
 - Time is split into rounds (`config.round_seconds`, currently 60 s). Each
   round freezes a budget of 10 tokens/min pro-rata. Empty round = emission
   lapses.
-- One PoW submit (keccak, proof-of-liveness) per miner per round — extra
+- One PoW submit (keccak, proof-of-liveness) per miner per round; extra
   submits are rejected, so faster infrastructure gives no edge.
-- Weight = base (100 tokens) + `min(balance now, balance at previous submit)`
-  — each token adds +1% power over the base; fresh tokens count from the next
+- Weight = base (100 tokens) + `min(balance now, balance at previous submit)`.
+  Each token adds +1% power over the base; fresh tokens count from the next
   round (anti-cycling / anti-flash).
 - Rewards settle lazily on the next submit/claim; `claim` mints from the
   treasury PDA.
@@ -50,12 +50,12 @@ miner crank    # optional: run the permissionless round crank
 
 ## Repository layout
 
-- `api/` — constants, account layouts (Config/Round/Miner), instruction
+- `api/`: constants, account layouts (Config/Round/Miner), instruction
   definitions, PDAs, instruction builders ([crates.io](https://crates.io/crates/miner-api))
-- `program/` — on-chain instruction processors
-- `program/tests/` — LiteSVM integration tests (happy paths + attacks:
+- `program/`: on-chain instruction processors
+- `program/tests/`: LiteSVM integration tests (happy paths + attacks:
   cycling, flash balance, duplicates, authorization)
-- `cli/` — terminal miner ([crates.io](https://crates.io/crates/miner-cli), binary: `miner`)
+- `cli/`: terminal miner ([crates.io](https://crates.io/crates/miner-cli), binary: `miner`)
 
 ## Build & test
 

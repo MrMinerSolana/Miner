@@ -6,7 +6,7 @@ use solana_program::{
 use crate::loaders::*;
 
 /// Sets (or clears) the session key allowed to sign submits.
-/// A session key can NOT claim — only mine.
+/// A session key can NOT claim, only mine.
 pub fn process(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let [authority_info, miner_info] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);

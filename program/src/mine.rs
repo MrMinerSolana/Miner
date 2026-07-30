@@ -6,7 +6,7 @@ use solana_program::{
 
 use crate::loaders::*;
 
-/// Hash submission — one per round.
+/// Hash submission, one per round.
 ///
 /// 1. Signature check (authority or session key).
 /// 2. Lazy settlement of the previous round (accrues pending_rewards).
@@ -52,7 +52,7 @@ pub fn process(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     }
 
     // One submit per round. After a submit last_round_weight > 0 (the base
-    // is > 0) and it is only zeroed when the next round settles — so
+    // is > 0) and it is only zeroed when the next round settles, so
     // (last_round == current && weight > 0) unambiguously means a duplicate.
     if miner.last_round == config.current_round && miner.last_round_weight > 0 {
         return Err(MinerError::AlreadySubmitted.into());

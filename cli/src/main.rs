@@ -102,7 +102,7 @@ impl Ctx {
     /// missing account.
     fn config(&self) -> Config {
         // RPC can return spurious "AccountNotFound" (a lagging node or
-        // throttling) — treat the config as missing only after several
+        // throttling), so treat the config as missing only after several
         // such reads in a row, so a long-running crank doesn't die on
         // a single hiccup.
         let mut missing_streak = 0u32;
@@ -111,18 +111,18 @@ impl Ctx {
                 Ok(data) if data.len() == core::mem::size_of::<Config>() => {
                     return bytemuck::pod_read_unaligned::<Config>(&data);
                 }
-                Ok(_) => panic!("no config account — run `miner init` first"),
+                Ok(_) => panic!("no config account, run `miner init` first"),
                 Err(e) => {
                     let msg = e.to_string();
                     // Note: on transport errors (e.g. 429) the client also
-                    // reports "AccountNotFound: ... HTTP status ..." — only
+                    // reports "AccountNotFound: ... HTTP status ...", so only
                     // consider the account missing without an HTTP error.
                     let looks_missing =
                         msg.contains("AccountNotFound") && !msg.contains("HTTP");
                     if looks_missing {
                         missing_streak += 1;
                         if missing_streak >= 5 {
-                            panic!("no config account — run `miner init` first");
+                            panic!("no config account, run `miner init` first");
                         }
                     } else {
                         missing_streak = 0;
@@ -275,7 +275,7 @@ fn cmd_init(ctx: &Ctx, args: &[String]) {
         sdk::initialize(payer, mint),
     ];
     ctx.send(&ixs, &[&mint_kp]).expect("init failed");
-    println!("OK — premined {} tokens to {}", PREMINE / ONE_TOKEN, payer);
+    println!("OK: premined {} tokens to {}", PREMINE / ONE_TOKEN, payer);
 }
 
 fn cmd_status(ctx: &Ctx) {
@@ -349,7 +349,7 @@ fn cmd_mine(ctx: &Ctx) {
                 );
             }
             Err(e) => {
-                // The round may have rolled over mid-submit — just retry.
+                // The round may have rolled over mid-submit; just retry.
                 println!("  submit failed ({}), retrying…", short_err(&e));
                 sleep(Duration::from_secs(2));
             }
@@ -359,7 +359,7 @@ fn cmd_mine(ctx: &Ctx) {
 
 /// Permissionless crank: rolls rounds over and cleans up old accounts.
 /// Sleeps until the end of the current round (per chain clock) instead of
-/// polling every few seconds — saves public RPC rate limits.
+/// polling every few seconds, which saves public RPC rate limits.
 fn cmd_crank(ctx: &Ctx) {
     use std::time::{SystemTime, UNIX_EPOCH};
     println!("Crank bot (Ctrl+C to stop)");
@@ -410,7 +410,7 @@ fn cmd_claim(ctx: &Ctx) {
         .get_token_account_balance(&pda::ata(&me, &mint))
         .map(|b| b.ui_amount_string)
         .unwrap_or_default();
-    println!("OK — token balance: {balance}");
+    println!("OK: token balance {balance}");
 }
 
 /// Admin: change parameters (difficulty, base weight, round length).
@@ -432,7 +432,7 @@ fn cmd_update_config(ctx: &Ctx, args: &[String]) {
     ctx.send(&[ix], &[]).expect("update_config failed");
     let config = ctx.config();
     println!(
-        "OK — difficulty {} bits | base weight {} tokens | round {} s",
+        "OK: difficulty {} bits | base weight {} tokens | round {} s",
         config.min_difficulty,
         config.base_weight / ONE_TOKEN,
         config.round_seconds
@@ -456,7 +456,7 @@ fn cmd_create_metadata(ctx: &Ctx, args: &[String]) {
 
     let ix = ix_create_metadata_v3(&mint, &payer, &payer, &update_authority);
     ctx.send(&[ix], &[]).expect("create_metadata failed");
-    println!("OK — metadata {TOKEN_NAME} ({TOKEN_SYMBOL}) for {mint}");
+    println!("OK: metadata {TOKEN_NAME} ({TOKEN_SYMBOL}) for {mint}");
 }
 
 /// Hand the admin role over (e.g. to a Squads multisig vault).
@@ -470,7 +470,7 @@ fn cmd_set_admin(ctx: &Ctx, args: &[String]) {
     let ix = sdk::set_admin(ctx.payer.pubkey(), new_admin);
     ctx.send(&[ix], &[]).expect("set_admin failed");
     let config = ctx.config();
-    println!("OK — admin: {}", Pubkey::new_from_array(config.admin));
+    println!("OK: admin {}", Pubkey::new_from_array(config.admin));
 }
 
 // ---------- helpers ----------

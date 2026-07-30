@@ -1,6 +1,6 @@
 [package]
 name = "miner-api"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Instructions, state and SDK for the MINER protocol - a proof-of-work mined SPL token where holdings boost mining power"
 license = "MIT"

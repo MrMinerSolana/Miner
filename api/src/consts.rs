@@ -10,7 +10,7 @@ pub const ONE_TOKEN: u64 = 10u64.pow(TOKEN_DECIMALS as u32);
 pub const EMISSION_PER_MINUTE: u64 = 10 * ONE_TOKEN;
 
 /// Initial round length in seconds (lives in Config, tunable via
-/// update_config — from an "ORE feel" cadence to a frugal one).
+/// update_config, from an "ORE feel" cadence to a frugal one).
 pub const INITIAL_ROUND_SECONDS: u64 = 60;
 
 /// Round length bounds for update_config.
@@ -24,13 +24,13 @@ pub const fn round_budget(round_seconds: u64) -> u64 {
 }
 
 /// How many rounds back Round accounts are kept before they can be closed
-/// (rent recovery — the crank closes old rounds and recycles the float).
+/// (rent recovery: the crank closes old rounds and recycles the float).
 /// 2880 rounds × 60 s = 2 days to settle a reward at launch settings.
 pub const ROUND_RETENTION: u64 = 2880;
 
 /// Initial minimum hash difficulty (leading zero bits).
 /// 20 bits ≈ 1M hashes: a few seconds on a desktop, a dozen or so on a
-/// weak CPU — proof-of-liveness is meant to take a moment, not be a race.
+/// weak CPU. Proof-of-liveness is meant to take a moment, not be a race.
 pub const INITIAL_MIN_DIFFICULTY: u64 = 20;
 
 /// Initial base weight (free tier) in native token units.

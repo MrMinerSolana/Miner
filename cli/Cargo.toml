@@ -1,6 +1,6 @@
 [package]
 name = "miner-cli"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "CLI miner for the MINER protocol on Solana - mine, claim and inspect from your terminal (binary: miner)"
 license = "MIT"
