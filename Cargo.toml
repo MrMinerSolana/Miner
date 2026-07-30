@@ -1,0 +1,13 @@
+[workspace]
+members = ["api", "program", "cli"]
+resolver = "2"
+
+[workspace.dependencies]
+solana-program = "4"
+bytemuck = { version = "1", features = ["derive"] }
+miner-api = { path = "api", version = "0.1.1" }
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1

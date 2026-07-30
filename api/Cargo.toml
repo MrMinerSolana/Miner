@@ -1,0 +1,12 @@
+[package]
+name = "miner-api"
+version = "0.1.1"
+edition = "2021"
+description = "Instructions, state and SDK for the MINER protocol - a proof-of-work mined SPL token where holdings boost mining power"
+license = "MIT"
+homepage = "https://miner.tools"
+documentation = "https://miner.tools"
+
+[dependencies]
+solana-program = { workspace = true }
+bytemuck = { workspace = true }

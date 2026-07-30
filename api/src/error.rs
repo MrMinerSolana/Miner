@@ -1,0 +1,39 @@
+use solana_program::program_error::ProgramError;
+
+/// Program errors (mapped to ProgramError::Custom).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum MinerError {
+    /// Hash does not meet the required difficulty.
+    InvalidHash = 0,
+    /// Account does not match the expected PDA / owner.
+    InvalidAccount = 1,
+    /// Wrong account discriminator.
+    InvalidDiscriminator = 2,
+    /// Signer is not authorized (neither authority nor session key).
+    Unauthorized = 3,
+    /// The given round is not the current round.
+    RoundMismatch = 4,
+    /// Miner already submitted in this round.
+    AlreadySubmitted = 5,
+    /// Round is still open (crank too early).
+    RoundStillOpen = 6,
+    /// Round too fresh to close (retention).
+    RoundNotExpired = 7,
+    /// Nothing to claim.
+    NothingToClaim = 8,
+    /// Token account mismatch (mint/owner/ATA).
+    InvalidTokenAccount = 9,
+    /// Mint does not meet the requirements (authority/decimals/freeze).
+    InvalidMint = 10,
+    /// Arithmetic overflow.
+    Overflow = 11,
+    /// Settling the previous round requires its account.
+    SettlementRequired = 12,
+}
+
+impl From<MinerError> for ProgramError {
+    fn from(e: MinerError) -> Self {
+        ProgramError::Custom(e as u32)
+    }
+}

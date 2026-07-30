@@ -1,0 +1,21 @@
+/target
+program-keypair/
+node_modules/
+web/dist/
+crank.log
+crank.err.log
+.env
+*.local
+web/.env.production
+
+# operational / internal — outside the public repo
+deploy/
+SPEC.md
+web/
+governance/
+sim_*.py
+sim_*.png
+
+# local test artifacts
+.loadtest/
+.validator/

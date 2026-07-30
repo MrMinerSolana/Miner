@@ -1,0 +1,20 @@
+[package]
+name = "miner-program"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = []
+no-entrypoint = []
+
+[dependencies]
+miner-api = { workspace = true }
+solana-program = { workspace = true }
+bytemuck = { workspace = true }
+
+[dev-dependencies]
+litesvm = "0.15"
+solana-sdk = "4"
