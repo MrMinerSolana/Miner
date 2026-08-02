@@ -510,6 +510,35 @@ fn test_empty_round_emission_lapses() {
 }
 
 #[test]
+fn test_crank_opens_round_despite_prefunded_pda() {
+    let (mut svm, admin, _mint) = setup();
+
+    // Griefing attack: round PDAs are predictable, so an attacker sends
+    // lamports to the next round's address before the crank creates it
+    // (890880 = rent minimum of an empty account, below the rent-exempt
+    // minimum for Round::SIZE, so the crank must top it up).
+    let (round1_key, _) = pda::round_pda(1);
+    svm.airdrop(&round1_key, 890_880).unwrap();
+
+    // The crank must open the round anyway.
+    advance_round(&mut svm, &admin);
+    assert_eq!(get_round(&svm, 1).index, 1);
+    let acc = svm.get_account(&round1_key).unwrap();
+    assert_eq!(acc.owner, miner_api::id());
+    assert_eq!(acc.data.len(), Round::SIZE);
+
+    // Variant with a balance above the rent-exempt minimum: no top-up
+    // needed, the lamports stay on the account and the crank still works.
+    let (round2_key, _) = pda::round_pda(2);
+    svm.airdrop(&round2_key, 10_000_000).unwrap();
+    advance_round(&mut svm, &admin);
+    assert_eq!(get_round(&svm, 2).index, 2);
+    let acc = svm.get_account(&round2_key).unwrap();
+    assert_eq!(acc.owner, miner_api::id());
+    assert_eq!(acc.lamports, 10_000_000);
+}
+
+#[test]
 fn test_set_admin_rotates_authority() {
     let (mut svm, admin, _mint) = setup();
     let new_admin = Keypair::new();

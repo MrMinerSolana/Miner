@@ -374,16 +374,20 @@ fn cmd_crank(ctx: &Ctx) {
         }
 
         let next = config.current_round + 1;
-        match ctx.send(&[sdk::crank(ctx.payer.pubkey(), next)], &[]) {
-            Ok(()) => {
-                println!("round #{next} opened");
-                // Cleanup: close the round that fell out of retention.
-                if let Some(old) = config.current_round.checked_sub(ROUND_RETENTION) {
-                    if ctx.read::<Round>(&pda::round_pda(old).0).is_some() {
-                        let _ = ctx.send(&[sdk::close_round(ctx.payer.pubkey(), old)], &[]);
-                    }
-                }
+        // Cleanup in the SAME transaction as the crank: round `next - RETENTION`
+        // becomes closable exactly when current_round is bumped, so bundling
+        // both instructions atomically wins any race for the rent refund (a
+        // separate close after the crank lost to a sniper that was skimming
+        // ~1.7 SOL per day). The close is added only when the round account
+        // exists, so its absence never blocks opening the new round.
+        let mut ixs = vec![sdk::crank(ctx.payer.pubkey(), next)];
+        if let Some(old) = next.checked_sub(ROUND_RETENTION) {
+            if ctx.read::<Round>(&pda::round_pda(old).0).is_some() {
+                ixs.push(sdk::close_round(ctx.payer.pubkey(), old));
             }
+        }
+        match ctx.send(&ixs, &[]) {
+            Ok(()) => println!("round #{next} opened"),
             Err(e) if e.contains("0x6") => sleep(Duration::from_secs(1)), /* round still open */
             Err(e) => {
                 println!("  crank error: {}", short_err(&e));

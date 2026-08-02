@@ -13,7 +13,7 @@ use solana_program::{
     entrypoint::ProgramResult,
     instruction::{AccountMeta, Instruction},
     keccak,
-    program::invoke_signed,
+    program::{invoke, invoke_signed},
     program_error::ProgramError,
     pubkey::Pubkey,
     rent::Rent,
@@ -72,6 +72,13 @@ pub fn write_state<T: Pod>(info: &AccountInfo, state: &T) -> ProgramResult {
 }
 
 /// Creates a program-owned PDA account.
+///
+/// Griefing-resistant: System CreateAccount refuses an account that already
+/// holds lamports, so anyone could block PDA creation by pre-funding the
+/// (predictable) address with a plain transfer. Instead we only guard against
+/// accounts with data (a truly initialized account), top up the rent-exempt
+/// minimum if needed, then allocate + assign with the PDA seeds. Both work
+/// on a system-owned account regardless of its lamport balance.
 pub fn create_pda<'info>(
     target: &AccountInfo<'info>,
     payer: &AccountInfo<'info>,
@@ -79,29 +86,48 @@ pub fn create_pda<'info>(
     space: usize,
     seeds: &[&[u8]],
 ) -> ProgramResult {
-    if !target.data_is_empty() || target.lamports() > 0 {
+    if !target.data_is_empty() {
         return Err(ProgramError::AccountAlreadyInitialized);
     }
     let rent = Rent::get()?.minimum_balance(space);
-    // SystemInstruction::CreateAccount (bincode): tag u32 + lamports + space + owner.
-    let mut data = Vec::with_capacity(52);
-    data.extend_from_slice(&0u32.to_le_bytes());
-    data.extend_from_slice(&rent.to_le_bytes());
+    let balance = target.lamports();
+    if balance < rent {
+        // SystemInstruction::Transfer (bincode): tag u32 + lamports u64.
+        let mut data = Vec::with_capacity(12);
+        data.extend_from_slice(&2u32.to_le_bytes());
+        data.extend_from_slice(&(rent - balance).to_le_bytes());
+        let ix = Instruction {
+            program_id: SYSTEM_PROGRAM_ID,
+            accounts: vec![
+                AccountMeta::new(*payer.key, true),
+                AccountMeta::new(*target.key, false),
+            ],
+            data,
+        };
+        invoke(&ix, &[payer.clone(), target.clone(), system_program.clone()])?;
+    }
+
+    // SystemInstruction::Allocate (bincode): tag u32 + space u64.
+    let mut data = Vec::with_capacity(12);
+    data.extend_from_slice(&8u32.to_le_bytes());
     data.extend_from_slice(&(space as u64).to_le_bytes());
+    let ix = Instruction {
+        program_id: SYSTEM_PROGRAM_ID,
+        accounts: vec![AccountMeta::new(*target.key, true)],
+        data,
+    };
+    invoke_signed(&ix, &[target.clone(), system_program.clone()], &[seeds])?;
+
+    // SystemInstruction::Assign (bincode): tag u32 + owner pubkey.
+    let mut data = Vec::with_capacity(36);
+    data.extend_from_slice(&1u32.to_le_bytes());
     data.extend_from_slice(miner_api::id().as_ref());
     let ix = Instruction {
         program_id: SYSTEM_PROGRAM_ID,
-        accounts: vec![
-            AccountMeta::new(*payer.key, true),
-            AccountMeta::new(*target.key, true),
-        ],
+        accounts: vec![AccountMeta::new(*target.key, true)],
         data,
     };
-    invoke_signed(
-        &ix,
-        &[payer.clone(), target.clone(), system_program.clone()],
-        &[seeds],
-    )
+    invoke_signed(&ix, &[target.clone(), system_program.clone()], &[seeds])
 }
 
 /// Entropy from the SlotHashes sysvar (most recent slot hash).
