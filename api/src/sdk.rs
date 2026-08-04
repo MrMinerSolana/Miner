@@ -103,6 +103,94 @@ pub fn claim(authority: Pubkey, mint: Pubkey, prev_round_index: u64) -> Instruct
     }
 }
 
+/// Mine for a miner enrolled in the referral program: appends the Referral
+/// PDA (writable; the program requires it once the miner is enrolled).
+pub fn mine_with_referral(
+    signer: Pubkey,
+    authority: Pubkey,
+    mint: Pubkey,
+    current_round_index: u64,
+    prev_round_index: u64,
+    nonce: u64,
+) -> Instruction {
+    let mut ix = mine(
+        signer,
+        authority,
+        mint,
+        current_round_index,
+        prev_round_index,
+        nonce,
+    );
+    ix.accounts
+        .push(AccountMeta::new(pda::referral_pda(&authority).0, false));
+    ix
+}
+
+/// Claim for a miner enrolled in the referral program. `chain` lists the
+/// upline wallets in order (level 1 = direct referrer, then their referrer,
+/// then the next; 1 to 3 entries). The builder appends the claimer's
+/// Referral PDA, then per level the recipient's Miner PDA plus, for levels
+/// 1 and 2, the recipient's own Referral PDA (possibly nonexistent: its
+/// emptiness proves on-chain that the chain ends there; shares of missing
+/// levels are burned). The caller must pass the full chain as recorded
+/// on-chain, otherwise the program rejects the claim.
+pub fn claim_with_referral(
+    authority: Pubkey,
+    mint: Pubkey,
+    prev_round_index: u64,
+    chain: &[Pubkey],
+) -> Instruction {
+    let mut ix = claim(authority, mint, prev_round_index);
+    ix.accounts
+        .push(AccountMeta::new(pda::referral_pda(&authority).0, false));
+    for (i, wallet) in chain.iter().enumerate() {
+        ix.accounts
+            .push(AccountMeta::new(pda::miner_pda(wallet).0, false));
+        if i + 1 < REFERRAL_LEVEL_BPS.len() {
+            ix.accounts
+                .push(AccountMeta::new_readonly(pda::referral_pda(wallet).0, false));
+        }
+    }
+    ix
+}
+
+/// Referral enrollment (once, immutable). The referrer must be registered.
+pub fn set_referrer(authority: Pubkey, referrer: Pubkey) -> Instruction {
+    let (miner, _) = pda::miner_pda(&authority);
+    let (referrer_miner, _) = pda::miner_pda(&referrer);
+    let (referral, _) = pda::referral_pda(&authority);
+    Instruction {
+        program_id: crate::id(),
+        accounts: vec![
+            AccountMeta::new(authority, true),
+            AccountMeta::new(miner, false),
+            AccountMeta::new_readonly(referrer_miner, false),
+            AccountMeta::new(referral, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+        ],
+        data: vec![MinerInstruction::SetReferrer as u8],
+    }
+}
+
+pub fn set_refname(authority: Pubkey, name: &str) -> Instruction {
+    let (miner, _) = pda::miner_pda(&authority);
+    let (refname, _) = pda::refname_pda(name.as_bytes());
+    let (refname_owner, _) = pda::refname_owner_pda(&authority);
+    let mut data = vec![MinerInstruction::SetRefName as u8];
+    data.extend_from_slice(name.as_bytes());
+    Instruction {
+        program_id: crate::id(),
+        accounts: vec![
+            AccountMeta::new(authority, true),
+            AccountMeta::new_readonly(miner, false),
+            AccountMeta::new(refname, false),
+            AccountMeta::new(refname_owner, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+        ],
+        data,
+    }
+}
+
 pub fn crank(payer: Pubkey, new_round_index: u64) -> Instruction {
     let (config, _) = pda::config_pda();
     let (new_round, _) = pda::round_pda(new_round_index);

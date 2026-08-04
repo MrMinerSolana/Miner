@@ -23,6 +23,115 @@ pub const fn round_budget(round_seconds: u64) -> u64 {
     EMISSION_PER_MINUTE * round_seconds / 60
 }
 
+/// Halving schedule. The round budget is cut in half every HALVING_SECONDS,
+/// with epochs counted from HALVING_ANCHOR_TS on the wall clock (Bitcoin's
+/// block-height schedule works the same way: late blocks lapse from the
+/// schedule, exactly like our empty rounds). The geometric series bounds
+/// all future emission to 2 * daily emission * period, which pins the max
+/// supply without any on-chain supply tracking:
+///   max supply = supply at anchor + 2 * 14_400 * period_days < 3.0M.
+/// Finalized for the 2026-08-04 deploy: the anchor is that day's (already
+/// past) midnight UTC, when the minted supply was <= 1,066,042, so the cap
+/// is bounded by 1,066,042 + 2 * 14_400 * 67 = 2,995,642. Real supply will
+/// land lower still: empty rounds, unfilled referral levels and rewards
+/// unclaimed past retention all burn from the schedule.
+#[cfg(not(feature = "short-halving"))]
+pub const HALVING_ANCHOR_TS: i64 = 1_785_801_600; // 2026-08-04 00:00:00 UTC
+#[cfg(not(feature = "short-halving"))]
+pub const HALVING_SECONDS: i64 = 67 * 86_400;
+
+/// Devnet rehearsal (`--features short-halving`): the same code path with a
+/// compressed schedule (halving every 5 minutes) so the halvings can be
+/// watched live on a real cluster. Never part of a mainnet artifact.
+#[cfg(feature = "short-halving")]
+pub const HALVING_ANCHOR_TS: i64 = 1_785_854_400; // 2026-08-04 14:40:00 UTC
+#[cfg(feature = "short-halving")]
+pub const HALVING_SECONDS: i64 = 300;
+
+/// Round budget for a round opened at unix time `now`: the base pro-rata
+/// budget halved once per elapsed halving epoch. Before the anchor the
+/// budget is the plain base. checked_shr guards the shift: a u64 shift by
+/// >= 64 would wrap in release builds and "revive" the emission; instead
+/// the budget pins to zero (it naturally reaches zero after ~34 halvings).
+pub const fn round_budget_at(round_seconds: u64, now: i64) -> u64 {
+    let base = round_budget(round_seconds);
+    if now <= HALVING_ANCHOR_TS {
+        return base;
+    }
+    let epoch = ((now - HALVING_ANCHOR_TS) / HALVING_SECONDS) as u32;
+    match base.checked_shr(epoch) {
+        Some(b) => b,
+        None => 0,
+    }
+}
+
+#[cfg(test)]
+mod halving_tests {
+    use super::*;
+
+    const BASE: u64 = round_budget(60);
+
+    /// Epoch boundaries are exact: the budget switches at the very second
+    /// of anchor + k * HALVING_SECONDS, never one second early or late.
+    #[test]
+    fn boundaries() {
+        assert_eq!(round_budget_at(60, 0), BASE);
+        assert_eq!(round_budget_at(60, HALVING_ANCHOR_TS), BASE);
+        assert_eq!(
+            round_budget_at(60, HALVING_ANCHOR_TS + HALVING_SECONDS - 1),
+            BASE
+        );
+        assert_eq!(
+            round_budget_at(60, HALVING_ANCHOR_TS + HALVING_SECONDS),
+            BASE / 2
+        );
+        assert_eq!(
+            round_budget_at(60, HALVING_ANCHOR_TS + 2 * HALVING_SECONDS - 1),
+            BASE / 2
+        );
+        assert_eq!(
+            round_budget_at(60, HALVING_ANCHOR_TS + 2 * HALVING_SECONDS),
+            BASE / 4
+        );
+        assert_eq!(
+            round_budget_at(60, HALVING_ANCHOR_TS + 10 * HALVING_SECONDS),
+            BASE >> 10
+        );
+    }
+
+    /// The budget reaches zero naturally (600e9 native units shift out
+    /// after 40 halvings) and STAYS zero past epoch 64, where an unguarded
+    /// u64 shift would wrap and "revive" the emission.
+    #[test]
+    fn reaches_zero_and_stays() {
+        assert_eq!(round_budget_at(60, HALVING_ANCHOR_TS + 40 * HALVING_SECONDS), 0);
+        assert_eq!(round_budget_at(60, HALVING_ANCHOR_TS + 63 * HALVING_SECONDS), 0);
+        assert_eq!(round_budget_at(60, HALVING_ANCHOR_TS + 64 * HALVING_SECONDS), 0);
+        assert_eq!(round_budget_at(60, HALVING_ANCHOR_TS + 500 * HALVING_SECONDS), 0);
+    }
+
+    /// All emission after the anchor is bounded by the geometric series:
+    /// sum over epochs of (per-epoch emission) <= 2 * base epoch emission.
+    #[test]
+    fn tail_emission_bounded() {
+        let epoch_emission = |e: u32| {
+            (round_budget_at(60, HALVING_ANCHOR_TS + e as i64 * HALVING_SECONDS) as u128)
+                * (HALVING_SECONDS as u128)
+                / 60
+        };
+        let total: u128 = (0..128).map(epoch_emission).sum();
+        let bound = 2 * (EMISSION_PER_MINUTE as u128) * (HALVING_SECONDS as u128) / 60;
+        assert!(total <= bound, "total {total} > bound {bound}");
+    }
+
+    /// The budget scales pro-rata with the round length inside an epoch.
+    #[test]
+    fn pro_rata_round_length() {
+        let ts = HALVING_ANCHOR_TS + 3 * HALVING_SECONDS;
+        assert_eq!(round_budget_at(15, ts) * 4, round_budget_at(60, ts));
+    }
+}
+
 /// How many rounds back Round accounts are kept before they can be closed
 /// (rent recovery: the crank closes old rounds and recycles the float).
 /// 2880 rounds × 60 s = 2 days to settle a reward at launch settings.
@@ -38,11 +147,49 @@ pub const INITIAL_MIN_DIFFICULTY: u64 = 20;
 /// the base (100 tokens = 2×). Tuned via update_config.
 pub const INITIAL_BASE_WEIGHT: u64 = 100 * ONE_TOKEN;
 
+/// Referral program, in basis points. The referee's token-derived weight is
+/// boosted by REFERRAL_BONUS_BPS. The reward slice earned by that (boosted)
+/// token weight is charged a three-level commission ladder: level 1 is the
+/// direct inviter, level 2 their inviter, level 3 the next one up. At
+/// settlement the full ladder total is carved into a pool; at claim the pool
+/// is split by level, and the shares of levels that do not exist (short
+/// chain, cycles) are BURNED, never minted, so the carve is flat for every
+/// enrolled miner regardless of chain depth. The base weight slice is never
+/// charged, so enrolling stays net-positive at any balance as long as the
+/// compile-time guard below holds: (1 + bonus) * (1 - ladder total) > 1.
+pub const REFERRAL_BONUS_BPS: u64 = 1500;
+pub const REFERRAL_LEVEL_BPS: [u64; 3] = [500, 300, 100];
+pub const REFERRAL_TOTAL_BPS: u64 =
+    REFERRAL_LEVEL_BPS[0] + REFERRAL_LEVEL_BPS[1] + REFERRAL_LEVEL_BPS[2];
+pub const BPS_DENOM: u64 = 10_000;
+const _REFEREE_NET_POSITIVE: () = assert!(
+    (BPS_DENOM + REFERRAL_BONUS_BPS) * (BPS_DENOM - REFERRAL_TOTAL_BPS)
+        > BPS_DENOM * BPS_DENOM
+);
+
+/// Flag stored in the high bits of Miner.bump (the PDA seed byte itself is
+/// the low byte, so `bump as u8` stays correct everywhere). When set, the
+/// miner enrolled in the referral program and mine/claim must be given the
+/// Referral account, otherwise commissions could be skipped.
+pub const MINER_FLAG_REFERRAL: u64 = 1 << 8;
+
+/// Custom referral name (vanity code) length bounds. Charset: a-z 0-9 _
+/// (lowercase only, clients normalize before sending). First come, first
+/// served; one name per miner; immutable. Rent makes mass squatting cost
+/// real SOL.
+pub const REFNAME_MIN_LEN: usize = 3;
+pub const REFNAME_MAX_LEN: usize = 16;
+
 /// PDA seeds.
 pub const CONFIG_SEED: &[u8] = b"config";
 pub const TREASURY_SEED: &[u8] = b"treasury";
 pub const ROUND_SEED: &[u8] = b"round";
 pub const MINER_SEED: &[u8] = b"miner";
+pub const REFERRAL_SEED: &[u8] = b"referral";
+/// name -> owner (uniqueness + resolution of ?ref=<name> links).
+pub const REFNAME_SEED: &[u8] = b"refname";
+/// owner -> name (reverse lookup for UI + enforces one name per miner).
+pub const REFNAME_OWNER_SEED: &[u8] = b"refname_owner";
 
 /// External programs (canonical addresses).
 pub const SPL_TOKEN_PROGRAM_ID: Pubkey = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");

@@ -1,4 +1,4 @@
-use miner_api::{error::MinerError, sdk, state::*};
+use miner_api::{consts::*, error::MinerError, sdk, state::*};
 use solana_program::{
     account_info::AccountInfo, entrypoint::ProgramResult, keccak,
     program_error::ProgramError,
@@ -15,10 +15,21 @@ use crate::loaders::*;
 ///    Min-balance rule: freshly bought/transferred tokens only count from
 ///    the next round -> cycling tokens between wallets and flash balances
 ///    do not increase weight.
+///    Referral bonus: for an enrolled miner (trailing referral account,
+///    required by the flag in Miner.bump) the token slice of the weight is
+///    boosted by REFERRAL_BONUS_BPS. The bonus is applied after the
+///    min-balance rule, so the anti-cycling guarantee is unchanged.
 /// 5. Add the weight to the round and roll the challenge.
 pub fn process(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    // 7 accounts (legacy, miners not enrolled in the referral program) or 8
+    // (trailing referral account).
+    let (fixed_accounts, referral_info) = match accounts.len() {
+        7 => (accounts, None),
+        8 => (&accounts[..7], Some(&accounts[7])),
+        _ => return Err(ProgramError::NotEnoughAccountKeys),
+    };
     let [signer_info, miner_info, config_info, current_round_info, prev_round_info, token_account_info, slot_hashes_info] =
-        accounts
+        fixed_accounts
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
@@ -58,8 +69,15 @@ pub fn process(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
         return Err(MinerError::AlreadySubmitted.into());
     }
 
+    let mut referral = load_referral(&miner, referral_info)?;
+
     // Settle the previous round.
-    settle_previous_round(&mut miner, config.current_round, prev_round_info)?;
+    settle_previous_round(
+        &mut miner,
+        referral.as_mut(),
+        config.current_round,
+        prev_round_info,
+    )?;
 
     // PoW verification.
     let hash = keccak::hashv(&[
@@ -74,10 +92,22 @@ pub fn process(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     // Token balance (the account may not exist -> free tier, balance 0).
     let balance = read_token_balance(token_account_info, &config.mint, &miner.authority)?;
 
-    // Weight: base + min(balance, previous balance).
+    // Weight: base + min(balance, previous balance), the token slice boosted
+    // by the referral bonus for enrolled miners.
+    let counted_balance = balance.min(miner.last_balance);
+    let token_weight = match referral.as_mut() {
+        Some(r) => {
+            let boosted = ((counted_balance as u128)
+                * ((BPS_DENOM + REFERRAL_BONUS_BPS) as u128)
+                / (BPS_DENOM as u128)) as u64;
+            r.last_token_weight = boosted;
+            boosted
+        }
+        None => counted_balance,
+    };
     let weight = config
         .base_weight
-        .checked_add(balance.min(miner.last_balance))
+        .checked_add(token_weight)
         .ok_or(MinerError::Overflow)?;
 
     round.total_weight = round
@@ -97,6 +127,10 @@ pub fn process(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
         .checked_add(1)
         .ok_or(MinerError::Overflow)?;
     write_state(miner_info, &miner)?;
+
+    if let (Some(r), Some(info)) = (referral.as_ref(), referral_info) {
+        write_state(info, r)?;
+    }
 
     Ok(())
 }

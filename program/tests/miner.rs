@@ -140,6 +140,10 @@ fn get_round(svm: &LiteSVM, index: u64) -> Round {
     get_state(svm, &pda::round_pda(index).0)
 }
 
+fn get_referral(svm: &LiteSVM, authority: &Pubkey) -> Referral {
+    get_state(svm, &pda::referral_pda(authority).0)
+}
+
 fn token_balance(svm: &LiteSVM, mint: &Pubkey, owner: &Pubkey) -> u64 {
     let acc = svm.get_account(&pda::ata(owner, mint)).unwrap();
     u64::from_le_bytes(acc.data[64..72].try_into().unwrap())
@@ -182,6 +186,47 @@ fn mine(svm: &mut LiteSVM, authority: &Keypair, mint: &Pubkey) -> Result<(), Str
         authority,
         &[],
     )
+}
+
+/// Mine for a miner enrolled in the referral program (trailing referral
+/// account), signed by the authority.
+fn mine_ref(svm: &mut LiteSVM, authority: &Keypair, mint: &Pubkey) -> Result<(), String> {
+    let config = get_config(svm);
+    let miner = get_miner(svm, &authority.pubkey());
+    let nonce = grind(svm, &authority.pubkey());
+    send(
+        svm,
+        &[sdk::mine_with_referral(
+            authority.pubkey(),
+            authority.pubkey(),
+            *mint,
+            config.current_round,
+            miner.last_round,
+            nonce,
+        )],
+        authority,
+        &[],
+    )
+}
+
+/// Warps the chain clock to an absolute timestamp.
+fn warp_to(svm: &mut LiteSVM, ts: i64) {
+    let mut clock: Clock = svm.get_sysvar();
+    clock.unix_timestamp = ts;
+    svm.set_sysvar(&clock);
+    svm.expire_blockhash();
+}
+
+/// Rolls the round over with the crank at the current clock.
+fn crank_next(svm: &mut LiteSVM, payer: &Keypair) {
+    let config = get_config(svm);
+    send(
+        svm,
+        &[sdk::crank(payer.pubkey(), config.current_round + 1)],
+        payer,
+        &[],
+    )
+    .expect("crank");
 }
 
 /// Advances the clock and rolls the round over with the crank.
@@ -654,4 +699,547 @@ fn test_update_config_difficulty_cap() {
     )
     .expect("difficulty 32 within the cap");
     assert_eq!(get_config(&svm).min_difficulty, 32);
+}
+
+/// Halving schedule: the round budget halves every HALVING_SECONDS from
+/// HALVING_ANCHOR_TS, is frozen per round, and pins to zero in the deep
+/// future (guarded shift; a wrap would "revive" the emission).
+#[test]
+fn test_halving_schedule() {
+    let (mut svm, admin, mint) = setup();
+
+    // Before the anchor: the full base budget.
+    warp_to(&mut svm, HALVING_ANCHOR_TS - 1_000);
+    crank_next(&mut svm, &admin);
+    let cfg = get_config(&svm);
+    assert_eq!(get_round(&svm, cfg.current_round).budget, DEFAULT_BUDGET);
+
+    // Epoch 0 (after the anchor, before the first halving): still full.
+    warp_to(&mut svm, HALVING_ANCHOR_TS + 1_000);
+    crank_next(&mut svm, &admin);
+    let cfg = get_config(&svm);
+    assert_eq!(get_round(&svm, cfg.current_round).budget, DEFAULT_BUDGET);
+
+    // Epoch 1: half. Epoch 5: 1/32.
+    warp_to(&mut svm, HALVING_ANCHOR_TS + HALVING_SECONDS + 1_000);
+    crank_next(&mut svm, &admin);
+    let cfg = get_config(&svm);
+    assert_eq!(get_round(&svm, cfg.current_round).budget, DEFAULT_BUDGET / 2);
+
+    warp_to(&mut svm, HALVING_ANCHOR_TS + 5 * HALVING_SECONDS + 1_000);
+    crank_next(&mut svm, &admin);
+    let cfg = get_config(&svm);
+    let halved = DEFAULT_BUDGET / 32;
+    assert_eq!(get_round(&svm, cfg.current_round).budget, halved);
+
+    // A miner in a halved round settles the halved budget (solo -> 100%).
+    let kp = Keypair::new();
+    register_miner(&mut svm, &kp);
+    mine(&mut svm, &kp, &mint).expect("mine in a halved round");
+    advance_round(&mut svm, &admin);
+    mine(&mut svm, &kp, &mint).expect("mine settles the previous round");
+    assert_eq!(get_miner(&svm, &kp.pubkey()).pending_rewards, halved);
+
+    // Deep future: the budget reaches zero naturally (~34 halvings) and
+    // STAYS zero past epoch 64, where an unguarded u64 shift would wrap.
+    warp_to(&mut svm, HALVING_ANCHOR_TS + 40 * HALVING_SECONDS);
+    crank_next(&mut svm, &admin);
+    let cfg = get_config(&svm);
+    assert_eq!(get_round(&svm, cfg.current_round).budget, 0);
+
+    warp_to(&mut svm, HALVING_ANCHOR_TS + 70 * HALVING_SECONDS);
+    crank_next(&mut svm, &admin);
+    let cfg = get_config(&svm);
+    assert_eq!(get_round(&svm, cfg.current_round).budget, 0);
+}
+
+#[test]
+fn test_referral_full_flow() {
+    let (mut svm, admin, mint) = setup();
+    let referrer = Keypair::new();
+    let referee = Keypair::new();
+    register_miner(&mut svm, &referrer);
+    register_miner(&mut svm, &referee);
+
+    // Enrollment: Referral PDA created, Miner flagged.
+    send(
+        &mut svm,
+        &[sdk::set_referrer(referee.pubkey(), referrer.pubkey())],
+        &referee,
+        &[],
+    )
+    .expect("set_referrer");
+    let r = get_referral(&svm, &referee.pubkey());
+    assert_eq!(r.authority, referee.pubkey().to_bytes());
+    assert_eq!(r.referrer, referrer.pubkey().to_bytes());
+    let m = get_miner(&svm, &referee.pubkey());
+    assert!(m.bump & MINER_FLAG_REFERRAL != 0);
+
+    // Round 0: min-balance rule -> the fresh balance does not count yet, so
+    // the boost has nothing to amplify (weight = base only).
+    let tokens = 1_000 * ONE_TOKEN;
+    set_balance(&mut svm, &mint, &referee.pubkey(), tokens);
+    mine_ref(&mut svm, &referee, &mint).expect("mine r0");
+    assert_eq!(get_round(&svm, 0).total_weight, INITIAL_BASE_WEIGHT);
+
+    // Round 1: the token slice counts and is boosted by the referral bonus.
+    let boosted = tokens * (BPS_DENOM + REFERRAL_BONUS_BPS) / BPS_DENOM;
+    advance_round(&mut svm, &admin);
+    mine_ref(&mut svm, &referee, &mint).expect("mine r1");
+    assert_eq!(
+        get_round(&svm, 1).total_weight,
+        INITIAL_BASE_WEIGHT + boosted
+    );
+
+    // Round 2 submit settles round 1: sole miner -> the whole budget, the
+    // token-slice reward charged the full ladder total into the pool.
+    advance_round(&mut svm, &admin);
+    mine_ref(&mut svm, &referee, &mint).expect("mine r2");
+    let weight = INITIAL_BASE_WEIGHT + boosted;
+    let token_reward =
+        (DEFAULT_BUDGET as u128 * boosted as u128 / weight as u128) as u64;
+    let pool = token_reward * REFERRAL_TOTAL_BPS / BPS_DENOM;
+    // Round 0 settled earlier for the full budget (base weight only, no
+    // commission), round 1 for budget - pool.
+    let m = get_miner(&svm, &referee.pubkey());
+    assert_eq!(m.pending_rewards, DEFAULT_BUDGET + DEFAULT_BUDGET - pool);
+    let r = get_referral(&svm, &referee.pubkey());
+    assert_eq!(r.pending_commission, pool);
+    assert!(pool > 0);
+
+    // Referee claims with a 1-level chain: the referrer takes the level-1
+    // share, the shares of the missing levels 2 and 3 BURN (the referrer's
+    // empty Referral PDA in the tx proves the chain ends). The carve is
+    // flat: the referee gives up the full pool no matter the chain depth.
+    let l1_share =
+        (pool as u128 * REFERRAL_LEVEL_BPS[0] as u128 / REFERRAL_TOTAL_BPS as u128) as u64;
+    let burned = pool - l1_share;
+    let m = get_miner(&svm, &referee.pubkey());
+    send(
+        &mut svm,
+        &[sdk::claim_with_referral(
+            referee.pubkey(),
+            mint,
+            m.last_round,
+            &[referrer.pubkey()],
+        )],
+        &referee,
+        &[],
+    )
+    .expect("claim with referral");
+    assert_eq!(
+        token_balance(&svm, &mint, &referee.pubkey()),
+        tokens + 2 * DEFAULT_BUDGET - pool
+    );
+    let r = get_referral(&svm, &referee.pubkey());
+    assert_eq!(r.pending_commission, 0);
+    assert_eq!(r.total_commission, l1_share);
+    assert_eq!(r.total_burned, burned);
+    assert!(burned > 0);
+    let referrer_miner = get_miner(&svm, &referrer.pubkey());
+    assert_eq!(referrer_miner.pending_rewards, l1_share);
+
+    // The referrer claims the commission with a plain (legacy) claim.
+    set_balance(&mut svm, &mint, &referrer.pubkey(), 0);
+    send(
+        &mut svm,
+        &[sdk::claim(referrer.pubkey(), mint, 0)],
+        &referrer,
+        &[],
+    )
+    .expect("referrer claim");
+    assert_eq!(token_balance(&svm, &mint, &referrer.pubkey()), l1_share);
+
+    // Conservation: referee net + referrer commission + burn == 2 budgets,
+    // i.e. the burn is exactly the emission that never got minted.
+    assert_eq!(
+        (2 * DEFAULT_BUDGET - pool) + l1_share + burned,
+        2 * DEFAULT_BUDGET
+    );
+}
+
+/// Full 3-level ladder: X is referred by A, A by B, B by C. X's commission
+/// pool splits 5/3/1 across A, B and C; only the rounding dust burns.
+#[test]
+fn test_referral_ladder_three_levels() {
+    let (mut svm, admin, mint) = setup();
+    let x = Keypair::new();
+    let a = Keypair::new();
+    let b = Keypair::new();
+    let c = Keypair::new();
+    for kp in [&x, &a, &b, &c] {
+        register_miner(&mut svm, kp);
+    }
+    send(&mut svm, &[sdk::set_referrer(x.pubkey(), a.pubkey())], &x, &[])
+        .expect("x -> a");
+    send(&mut svm, &[sdk::set_referrer(a.pubkey(), b.pubkey())], &a, &[])
+        .expect("a -> b");
+    send(&mut svm, &[sdk::set_referrer(b.pubkey(), c.pubkey())], &b, &[])
+        .expect("b -> c");
+
+    let tokens = 1_000 * ONE_TOKEN;
+    set_balance(&mut svm, &mint, &x.pubkey(), tokens);
+    mine_ref(&mut svm, &x, &mint).expect("mine r0");
+    advance_round(&mut svm, &admin);
+    mine_ref(&mut svm, &x, &mint).expect("mine r1");
+    advance_round(&mut svm, &admin);
+    mine_ref(&mut svm, &x, &mint).expect("mine r2");
+
+    let r = get_referral(&svm, &x.pubkey());
+    let pool = r.pending_commission;
+    assert!(pool > 0);
+    let share = |level: usize| {
+        (pool as u128 * REFERRAL_LEVEL_BPS[level] as u128 / REFERRAL_TOTAL_BPS as u128) as u64
+    };
+
+    // The claim must carry the full chain: a 1-level claim is rejected
+    // because A's live Referral PDA proves the chain continues.
+    let m = get_miner(&svm, &x.pubkey());
+    let err = send(
+        &mut svm,
+        &[sdk::claim_with_referral(
+            x.pubkey(),
+            mint,
+            m.last_round,
+            &[a.pubkey()],
+        )],
+        &x,
+        &[],
+    )
+    .expect_err("a shortened chain must fail");
+    assert!(err.contains("Custom(1)"), "expected InvalidAccount: {err}");
+
+    // So is a 2-level claim (B is enrolled too).
+    svm.expire_blockhash();
+    let err = send(
+        &mut svm,
+        &[sdk::claim_with_referral(
+            x.pubkey(),
+            mint,
+            m.last_round,
+            &[a.pubkey(), b.pubkey()],
+        )],
+        &x,
+        &[],
+    )
+    .expect_err("a shortened chain must fail");
+    assert!(err.contains("Custom(1)"), "expected InvalidAccount: {err}");
+
+    // The full chain distributes 5/3/1.
+    send(
+        &mut svm,
+        &[sdk::claim_with_referral(
+            x.pubkey(),
+            mint,
+            m.last_round,
+            &[a.pubkey(), b.pubkey(), c.pubkey()],
+        )],
+        &x,
+        &[],
+    )
+    .expect("claim with the full chain");
+    assert_eq!(get_miner(&svm, &a.pubkey()).pending_rewards, share(0));
+    assert_eq!(get_miner(&svm, &b.pubkey()).pending_rewards, share(1));
+    assert_eq!(get_miner(&svm, &c.pubkey()).pending_rewards, share(2));
+    let distributed = share(0) + share(1) + share(2);
+    let r = get_referral(&svm, &x.pubkey());
+    assert_eq!(r.pending_commission, 0);
+    assert_eq!(r.total_commission, distributed);
+    // With a full chain only the rounding dust burns.
+    assert_eq!(r.total_burned, pool - distributed);
+    // X pays the flat carve: the full pool, same as any other depth.
+    assert_eq!(
+        token_balance(&svm, &mint, &x.pubkey()),
+        tokens + 2 * DEFAULT_BUDGET - pool
+    );
+}
+
+/// A mutual cycle (X <-> A) must not break the chain walk: X's level-2
+/// slot points back at X (that share BURNS, no double write) and level 3
+/// is A again (paid twice, sequentially).
+#[test]
+fn test_referral_cycle_claim() {
+    let (mut svm, admin, mint) = setup();
+    let x = Keypair::new();
+    let a = Keypair::new();
+    register_miner(&mut svm, &x);
+    register_miner(&mut svm, &a);
+    send(&mut svm, &[sdk::set_referrer(x.pubkey(), a.pubkey())], &x, &[])
+        .expect("x -> a");
+    send(&mut svm, &[sdk::set_referrer(a.pubkey(), x.pubkey())], &a, &[])
+        .expect("a -> x");
+
+    let tokens = 1_000 * ONE_TOKEN;
+    set_balance(&mut svm, &mint, &x.pubkey(), tokens);
+    mine_ref(&mut svm, &x, &mint).expect("mine r0");
+    advance_round(&mut svm, &admin);
+    mine_ref(&mut svm, &x, &mint).expect("mine r1");
+    advance_round(&mut svm, &admin);
+    mine_ref(&mut svm, &x, &mint).expect("mine r2");
+
+    let pool = get_referral(&svm, &x.pubkey()).pending_commission;
+    assert!(pool > 0);
+    let share = |level: usize| {
+        (pool as u128 * REFERRAL_LEVEL_BPS[level] as u128 / REFERRAL_TOTAL_BPS as u128) as u64
+    };
+
+    // Chain resolved from on-chain state: A, then X (cycle), then A again.
+    let m = get_miner(&svm, &x.pubkey());
+    send(
+        &mut svm,
+        &[sdk::claim_with_referral(
+            x.pubkey(),
+            mint,
+            m.last_round,
+            &[a.pubkey(), x.pubkey(), a.pubkey()],
+        )],
+        &x,
+        &[],
+    )
+    .expect("claim through the cycle");
+    // A collects levels 1 and 3; X's own level-2 share burns (a cycle back
+    // to yourself pays the flat carve like everyone else, no discount).
+    let distributed = share(0) + share(2);
+    assert_eq!(get_miner(&svm, &a.pubkey()).pending_rewards, distributed);
+    assert_eq!(
+        token_balance(&svm, &mint, &x.pubkey()),
+        tokens + 2 * DEFAULT_BUDGET - pool
+    );
+    let r = get_referral(&svm, &x.pubkey());
+    assert_eq!(r.total_commission, distributed);
+    assert_eq!(r.total_burned, pool - distributed);
+    assert!(r.total_burned >= share(1));
+}
+
+#[test]
+fn test_set_referrer_guards() {
+    let (mut svm, _admin, _mint) = setup();
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    register_miner(&mut svm, &alice);
+    register_miner(&mut svm, &bob);
+
+    // Self-referral rejected.
+    let err = send(
+        &mut svm,
+        &[sdk::set_referrer(alice.pubkey(), alice.pubkey())],
+        &alice,
+        &[],
+    )
+    .expect_err("self-referral must fail");
+    assert!(err.contains("Custom(13)"), "expected SelfReferral: {err}");
+
+    // An unregistered referrer rejected.
+    let err = send(
+        &mut svm,
+        &[sdk::set_referrer(alice.pubkey(), Pubkey::new_unique())],
+        &alice,
+        &[],
+    )
+    .expect_err("an unregistered referrer must fail");
+    assert!(err.contains("Custom(1)"), "expected InvalidAccount: {err}");
+
+    // Enrollment is immutable: the second set_referrer fails on the
+    // existing Referral account (even towards the same referrer).
+    send(
+        &mut svm,
+        &[sdk::set_referrer(alice.pubkey(), bob.pubkey())],
+        &alice,
+        &[],
+    )
+    .expect("first enrollment");
+    svm.expire_blockhash();
+    let err = send(
+        &mut svm,
+        &[sdk::set_referrer(alice.pubkey(), bob.pubkey())],
+        &alice,
+        &[],
+    )
+    .expect_err("re-enrollment must fail");
+    assert!(
+        err.contains("AccountAlreadyInitialized"),
+        "expected AccountAlreadyInitialized: {err}"
+    );
+
+    // Mutual referral (alice <-> bob) is allowed at enrollment: the claim
+    // chain walk treats a cycle back to the claimer as a plain refund.
+    send(
+        &mut svm,
+        &[sdk::set_referrer(bob.pubkey(), alice.pubkey())],
+        &bob,
+        &[],
+    )
+    .expect("mutual referral");
+}
+
+#[test]
+fn test_enrolled_miner_must_pass_referral_accounts() {
+    let (mut svm, admin, mint) = setup();
+    let referrer = Keypair::new();
+    let referee = Keypair::new();
+    register_miner(&mut svm, &referrer);
+    register_miner(&mut svm, &referee);
+    send(
+        &mut svm,
+        &[sdk::set_referrer(referee.pubkey(), referrer.pubkey())],
+        &referee,
+        &[],
+    )
+    .expect("set_referrer");
+
+    // A legacy 7-account mine must be rejected (commission bookkeeping
+    // would be skipped otherwise).
+    let err = mine(&mut svm, &referee, &mint).expect_err("legacy mine must fail");
+    assert!(
+        err.contains("Custom(14)"),
+        "expected ReferralAccountRequired: {err}"
+    );
+    mine_ref(&mut svm, &referee, &mint).expect("mine with the referral account");
+
+    // A legacy 8-account claim must be rejected as well.
+    advance_round(&mut svm, &admin);
+    mine_ref(&mut svm, &referee, &mint).expect("mine r1");
+    let m = get_miner(&svm, &referee.pubkey());
+    set_balance(&mut svm, &mint, &referee.pubkey(), 0);
+    let err = send(
+        &mut svm,
+        &[sdk::claim(referee.pubkey(), mint, m.last_round)],
+        &referee,
+        &[],
+    )
+    .expect_err("legacy claim must fail");
+    assert!(
+        err.contains("Custom(14)"),
+        "expected ReferralAccountRequired: {err}"
+    );
+}
+
+#[test]
+fn test_referral_zero_balance_is_neutral() {
+    let (mut svm, admin, mint) = setup();
+    let referrer = Keypair::new();
+    let referee = Keypair::new();
+    register_miner(&mut svm, &referrer);
+    register_miner(&mut svm, &referee);
+    send(
+        &mut svm,
+        &[sdk::set_referrer(referee.pubkey(), referrer.pubkey())],
+        &referee,
+        &[],
+    )
+    .expect("set_referrer");
+
+    // No tokens -> the boost amplifies nothing and no commission accrues:
+    // a farm of empty referred wallets earns the referrer exactly zero.
+    mine_ref(&mut svm, &referee, &mint).expect("mine r0");
+    assert_eq!(get_round(&svm, 0).total_weight, INITIAL_BASE_WEIGHT);
+    advance_round(&mut svm, &admin);
+    mine_ref(&mut svm, &referee, &mint).expect("mine r1");
+    let m = get_miner(&svm, &referee.pubkey());
+    assert_eq!(m.pending_rewards, DEFAULT_BUDGET);
+    let r = get_referral(&svm, &referee.pubkey());
+    assert_eq!(r.pending_commission, 0);
+
+    // A non-enrolled miner may keep sending the trailing (empty) referral
+    // account: it is ignored, so clients can always append it.
+    let plain = Keypair::new();
+    register_miner(&mut svm, &plain);
+    mine_ref(&mut svm, &plain, &mint).expect("non-enrolled mine with a trailing account");
+}
+
+#[test]
+fn test_refname_claim_unique_and_immutable() {
+    let (mut svm, _admin, _mint) = setup();
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    register_miner(&mut svm, &alice);
+    register_miner(&mut svm, &bob);
+
+    // Alice claims "mrminer": both directions of the mapping get written.
+    send(
+        &mut svm,
+        &[sdk::set_refname(alice.pubkey(), "mrminer")],
+        &alice,
+        &[],
+    )
+    .expect("set_refname");
+    let by_name: RefName = get_state(&svm, &pda::refname_pda(b"mrminer").0);
+    assert_eq!(by_name.owner, alice.pubkey().to_bytes());
+    assert_eq!(by_name.name_str(), "mrminer");
+    let by_owner: RefName = get_state(&svm, &pda::refname_owner_pda(&alice.pubkey()).0);
+    assert_eq!(by_owner.name_str(), "mrminer");
+
+    // First come first served: Bob cannot take the same name.
+    let err = send(
+        &mut svm,
+        &[sdk::set_refname(bob.pubkey(), "mrminer")],
+        &bob,
+        &[],
+    )
+    .expect_err("a taken name must fail");
+    assert!(err.contains("AccountAlreadyInitialized"), "{err}");
+
+    // One name per miner: Alice cannot claim a second one.
+    let err = send(
+        &mut svm,
+        &[sdk::set_refname(alice.pubkey(), "othername")],
+        &alice,
+        &[],
+    )
+    .expect_err("a second name must fail");
+    assert!(err.contains("AccountAlreadyInitialized"), "{err}");
+
+    // A different free name still works for Bob.
+    send(
+        &mut svm,
+        &[sdk::set_refname(bob.pubkey(), "bob_42")],
+        &bob,
+        &[],
+    )
+    .expect("bob claims a free name");
+}
+
+#[test]
+fn test_refname_validation() {
+    let (mut svm, _admin, _mint) = setup();
+    let alice = Keypair::new();
+    register_miner(&mut svm, &alice);
+
+    // Too short, too long, uppercase, a dash: all rejected.
+    for bad in ["ab", "seventeen_chars_x", "MrMiner", "mr-miner"] {
+        let err = send(
+            &mut svm,
+            &[sdk::set_refname(alice.pubkey(), bad)],
+            &alice,
+            &[],
+        )
+        .expect_err("an invalid name must fail");
+        assert!(err.contains("Custom(15)"), "expected InvalidName for {bad}: {err}");
+        svm.expire_blockhash();
+    }
+
+    // An unregistered wallet cannot claim a name.
+    let nobody = Keypair::new();
+    svm.airdrop(&nobody.pubkey(), 1_000_000_000).unwrap();
+    let err = send(
+        &mut svm,
+        &[sdk::set_refname(nobody.pubkey(), "ghost")],
+        &nobody,
+        &[],
+    )
+    .expect_err("an unregistered wallet must fail");
+    assert!(err.contains("Custom(1)"), "expected InvalidAccount: {err}");
+
+    // The boundary lengths pass.
+    send(&mut svm, &[sdk::set_refname(alice.pubkey(), "abc")], &alice, &[])
+        .expect("a 3-char name works");
+    let bob = Keypair::new();
+    register_miner(&mut svm, &bob);
+    send(
+        &mut svm,
+        &[sdk::set_refname(bob.pubkey(), "sixteen_chars_ok")],
+        &bob,
+        &[],
+    )
+    .expect("a 16-char name works");
 }

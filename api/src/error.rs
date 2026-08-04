@@ -30,6 +30,13 @@ pub enum MinerError {
     Overflow = 11,
     /// Settling the previous round requires its account.
     SettlementRequired = 12,
+    /// A miner cannot refer themselves.
+    SelfReferral = 13,
+    /// The miner enrolled in the referral program: mine/claim must be given
+    /// the Referral account (and the referrer's Miner account for claim).
+    ReferralAccountRequired = 14,
+    /// Referral name outside the 3-16 length bound or the a-z 0-9 _ charset.
+    InvalidName = 15,
 }
 
 impl From<MinerError> for ProgramError {

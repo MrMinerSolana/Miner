@@ -18,6 +18,18 @@ pub fn miner_pda(authority: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[MINER_SEED, authority.as_ref()], &crate::id())
 }
 
+pub fn referral_pda(authority: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[REFERRAL_SEED, authority.as_ref()], &crate::id())
+}
+
+pub fn refname_pda(name: &[u8]) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[REFNAME_SEED, name], &crate::id())
+}
+
+pub fn refname_owner_pda(authority: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[REFNAME_OWNER_SEED, authority.as_ref()], &crate::id())
+}
+
 /// Canonical Associated Token Account for (wallet, mint).
 pub fn ata(wallet: &Pubkey, mint: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(

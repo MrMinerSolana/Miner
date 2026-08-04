@@ -40,10 +40,16 @@ fn main() {
         "mine" => cmd_mine(&ctx),
         "crank" => cmd_crank(&ctx),
         "claim" => cmd_claim(&ctx),
+        "set-referrer" => cmd_set_referrer(&ctx, &args[2..]),
+        "set-refname" => cmd_set_refname(&ctx, &args[2..]),
         "update-config" => cmd_update_config(&ctx, &args[2..]),
         "set-admin" => cmd_set_admin(&ctx, &args[2..]),
         _ => {
-            eprintln!("usage: miner <init|status|mine|crank|claim|update-config|set-admin>");
+            eprintln!("usage: miner <init|status|mine|crank|claim|set-referrer|set-refname|update-config|set-admin>");
+            eprintln!("  set-referrer <name_or_pubkey>    (once, immutable: +15% token weight,");
+            eprintln!("                                    5/3/1% of token rewards up the chain)");
+            eprintln!("  set-refname <name>               (once, immutable: your custom referral");
+            eprintln!("                                    code, 3-16 chars a-z 0-9 _)");
             eprintln!("  update-config <min_difficulty> <base_weight_tokens> <round_seconds>");
             eprintln!("  set-admin <new_admin_pubkey>");
             std::process::exit(1);
@@ -286,6 +292,22 @@ fn cmd_status(ctx: &Ctx) {
     println!("round length:  {} s", config.round_seconds);
     println!("difficulty:    {} bits", config.min_difficulty);
     println!("base weight:   {} tokens", config.base_weight / ONE_TOKEN);
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let epoch = if now <= HALVING_ANCHOR_TS {
+            0
+        } else {
+            ((now - HALVING_ANCHOR_TS) / HALVING_SECONDS) as u32
+        };
+        let emission = EMISSION_PER_MINUTE.checked_shr(epoch).unwrap_or(0);
+        let next = HALVING_ANCHOR_TS + (epoch as i64 + 1) * HALVING_SECONDS;
+        println!(
+            "halving:       epoch {epoch} | emission {:.2} tokens/min | next in ~{} d",
+            emission as f64 / ONE_TOKEN as f64,
+            (next - now).max(0) / 86_400
+        );
+    }
     if let Some(round) = ctx.read::<Round>(&pda::round_pda(config.current_round).0) {
         println!(
             "total weight:  {:.2} tokens | budget {:.2} tokens",
@@ -301,6 +323,35 @@ fn cmd_status(ctx: &Ctx) {
             println!("mined:         {:.4} tokens", m.total_mined as f64 / ONE_TOKEN as f64);
             println!("hashes:        {}", m.total_hashes);
             println!("last round #{} (weight {:.2})", m.last_round, m.last_round_weight as f64 / ONE_TOKEN as f64);
+            match ctx.read::<Referral>(&pda::referral_pda(&me).0) {
+                Some(r) => {
+                    println!(
+                        "referral:      +{}% token weight, referrer {}",
+                        REFERRAL_BONUS_BPS / 100,
+                        Pubkey::new_from_array(r.referrer)
+                    );
+                    println!(
+                        "commission:    {:.4} pending | {:.4} lifetime (to your referral chain)",
+                        r.pending_commission as f64 / ONE_TOKEN as f64,
+                        r.total_commission as f64 / ONE_TOKEN as f64
+                    );
+                    println!(
+                        "burned:        {:.4} lifetime (unfilled referral levels)",
+                        r.total_burned as f64 / ONE_TOKEN as f64
+                    );
+                }
+                None => println!(
+                    "referral:      none (`miner set-referrer <pubkey>` = +{}% token weight)",
+                    REFERRAL_BONUS_BPS / 100
+                ),
+            }
+            match ctx.read::<RefName>(&pda::refname_owner_pda(&me).0) {
+                Some(n) => println!(
+                    "your ref link: https://miner.tools/?ref={}",
+                    n.name_str()
+                ),
+                None => println!("your ref link: https://miner.tools/?ref={me}"),
+            }
         }
         None => println!("miner: not registered (happens automatically on `miner mine`)"),
     }
@@ -316,6 +367,13 @@ fn cmd_mine(ctx: &Ctx) {
     if ctx.read::<Miner>(&miner_pda).is_none() {
         println!("Registering miner…");
         ctx.send(&[sdk::register(me)], &[]).expect("register");
+    }
+
+    // Referral enrollment is immutable, one read at startup is enough;
+    // refreshed on a ReferralAccountRequired error (enrolled mid-run).
+    let mut enrolled = ctx.read::<Referral>(&pda::referral_pda(&me).0).is_some();
+    if enrolled {
+        println!("Referral active: +{}% token weight", REFERRAL_BONUS_BPS / 100);
     }
 
     println!("Mining as {me} (Ctrl+C to stop)");
@@ -337,7 +395,11 @@ fn cmd_mine(ctx: &Ctx) {
             nonce = nonce.wrapping_add(1);
         }
 
-        let ix = sdk::mine(me, me, mint, config.current_round, miner.last_round, nonce);
+        let ix = if enrolled {
+            sdk::mine_with_referral(me, me, mint, config.current_round, miner.last_round, nonce)
+        } else {
+            sdk::mine(me, me, mint, config.current_round, miner.last_round, nonce)
+        };
         match ctx.send(&[ix], &[]) {
             Ok(()) => {
                 let m: Miner = ctx.read(&miner_pda).unwrap();
@@ -349,6 +411,12 @@ fn cmd_mine(ctx: &Ctx) {
                 );
             }
             Err(e) => {
+                // 0xe = ReferralAccountRequired: enrolled mid-run, switch over.
+                if e.contains("0xe") {
+                    enrolled = true;
+                    println!("  referral enrollment detected, adding the referral account");
+                    continue;
+                }
                 // The round may have rolled over mid-submit; just retry.
                 println!("  submit failed ({}), retrying…", short_err(&e));
                 sleep(Duration::from_secs(2));
@@ -404,10 +472,13 @@ fn cmd_claim(ctx: &Ctx) {
     let miner: Miner = ctx
         .read(&pda::miner_pda(&me).0)
         .expect("miner not registered");
-    let ixs = vec![
-        ix_create_ata_idempotent(&me, &me, &mint),
-        sdk::claim(me, mint, miner.last_round),
-    ];
+    // An enrolled miner's claim carries the full referral chain (the program
+    // proves its length on-chain and distributes the 5/3/1 commission pool).
+    let claim_ix = match ctx.read::<Referral>(&pda::referral_pda(&me).0) {
+        Some(r) => sdk::claim_with_referral(me, mint, miner.last_round, &referral_chain(ctx, &r)),
+        None => sdk::claim(me, mint, miner.last_round),
+    };
+    let ixs = vec![ix_create_ata_idempotent(&me, &me, &mint), claim_ix];
     ctx.send(&ixs, &[]).expect("claim failed");
     let balance = ctx
         .rpc
@@ -415,6 +486,89 @@ fn cmd_claim(ctx: &Ctx) {
         .map(|b| b.ui_amount_string)
         .unwrap_or_default();
     println!("OK: token balance {balance}");
+}
+
+/// Walks the on-chain referral chain up from the claimer: level 1 is the
+/// direct referrer, then their referrer, up to REFERRAL_LEVEL_BPS levels.
+fn referral_chain(ctx: &Ctx, referral: &Referral) -> Vec<Pubkey> {
+    let mut chain = vec![Pubkey::new_from_array(referral.referrer)];
+    while chain.len() < REFERRAL_LEVEL_BPS.len() {
+        match ctx.read::<Referral>(&pda::referral_pda(chain.last().unwrap()).0) {
+            Some(next) => chain.push(Pubkey::new_from_array(next.referrer)),
+            None => break,
+        }
+    }
+    chain
+}
+
+/// Resolves a referrer given as either a wallet address or a custom
+/// referral name (on-chain "refname" registry).
+fn resolve_referrer(ctx: &Ctx, arg: &str) -> Pubkey {
+    if let Ok(key) = arg.parse::<Pubkey>() {
+        return key;
+    }
+    let name = arg.to_lowercase();
+    let refname: RefName = ctx
+        .read(&pda::refname_pda(name.as_bytes()).0)
+        .unwrap_or_else(|| panic!("referral name '{name}' not found on-chain"));
+    Pubkey::new_from_array(refname.owner)
+}
+
+/// Referral enrollment (once, immutable): +15% token weight for this miner,
+/// 5/3/1% of its token-slice rewards to the chain of referrers. The referrer
+/// must be a registered miner. Registers the caller first if needed.
+fn cmd_set_referrer(ctx: &Ctx, args: &[String]) {
+    if args.len() != 1 {
+        eprintln!("usage: miner set-referrer <name_or_pubkey>");
+        std::process::exit(1);
+    }
+    let referrer = resolve_referrer(ctx, &args[0]);
+    let me = ctx.payer.pubkey();
+    if ctx.read::<Referral>(&pda::referral_pda(&me).0).is_some() {
+        println!("Referral already set (enrollment is immutable).");
+        return;
+    }
+
+    let mut ixs = Vec::new();
+    if ctx.read::<Miner>(&pda::miner_pda(&me).0).is_none() {
+        println!("Registering miner…");
+        ixs.push(sdk::register(me));
+    }
+    ixs.push(sdk::set_referrer(me, referrer));
+    ctx.send(&ixs, &[]).expect("set_referrer failed");
+    println!(
+        "OK: referral active, +{}% token weight; referrer {} earns {}% of your token rewards (their chain {}% and {}%)",
+        REFERRAL_BONUS_BPS / 100,
+        referrer,
+        REFERRAL_LEVEL_BPS[0] / 100,
+        REFERRAL_LEVEL_BPS[1] / 100,
+        REFERRAL_LEVEL_BPS[2] / 100
+    );
+}
+
+/// Claim a custom referral name (once, immutable, first come first served):
+/// links like miner.tools/?ref=<name> resolve to this wallet.
+fn cmd_set_refname(ctx: &Ctx, args: &[String]) {
+    if args.len() != 1 {
+        eprintln!("usage: miner set-refname <name>  (3-16 chars, a-z 0-9 _)");
+        std::process::exit(1);
+    }
+    let name = args[0].to_lowercase();
+    let me = ctx.payer.pubkey();
+    if let Some(existing) = ctx.read::<RefName>(&pda::refname_owner_pda(&me).0) {
+        println!("Name already claimed: '{}' (one per miner).", existing.name_str());
+        return;
+    }
+    if let Some(taken) = ctx.read::<RefName>(&pda::refname_pda(name.as_bytes()).0) {
+        println!(
+            "Name '{name}' is taken by {}.",
+            Pubkey::new_from_array(taken.owner)
+        );
+        return;
+    }
+    ctx.send(&[sdk::set_refname(me, &name)], &[])
+        .expect("set_refname failed");
+    println!("OK: your referral link is https://miner.tools/?ref={name}");
 }
 
 /// Admin: change parameters (difficulty, base weight, round length).

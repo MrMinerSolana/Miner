@@ -7,6 +7,8 @@ mod loaders;
 mod mine;
 mod register;
 mod set_admin;
+mod set_referrer;
+mod set_refname;
 mod update_config;
 
 use miner_api::instruction::MinerInstruction;
@@ -41,5 +43,7 @@ pub fn process_instruction(
         MinerInstruction::CloseRound => close_round::process(accounts),
         MinerInstruction::UpdateConfig => update_config::process(accounts, rest),
         MinerInstruction::SetAdmin => set_admin::process(accounts, rest),
+        MinerInstruction::SetReferrer => set_referrer::process(accounts),
+        MinerInstruction::SetRefName => set_refname::process(accounts, rest),
     }
 }

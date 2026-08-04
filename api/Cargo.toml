@@ -7,6 +7,12 @@ license = "MIT"
 homepage = "https://miner.tools"
 documentation = "https://miner.tools"
 
+[features]
+# Devnet rehearsal build: halvings every 5 minutes from a near-now anchor,
+# so the full schedule can be observed live on a real cluster. NEVER enable
+# for a mainnet artifact.
+short-halving = []
+
 [dependencies]
 solana-program = { workspace = true }
 bytemuck = { workspace = true }

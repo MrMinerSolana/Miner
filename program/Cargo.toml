@@ -9,6 +9,8 @@ crate-type = ["cdylib", "lib"]
 [features]
 default = []
 no-entrypoint = []
+# Forwarded to miner-api: devnet rehearsal with 5-minute halvings.
+short-halving = ["miner-api/short-halving"]
 
 [dependencies]
 miner-api = { workspace = true }

@@ -164,14 +164,43 @@ pub fn read_token_balance(
     Ok(u64::from_le_bytes(data[64..72].try_into().unwrap()))
 }
 
+/// Loads the miner's Referral account when the miner is enrolled
+/// (MINER_FLAG_REFERRAL in Miner.bump). Enrolled miners MUST pass the
+/// account, otherwise settlement could skip the commission bookkeeping.
+/// For non-enrolled miners a trailing account, if any, is ignored.
+pub fn load_referral(
+    miner: &Miner,
+    referral_info: Option<&AccountInfo>,
+) -> Result<Option<Referral>, ProgramError> {
+    if miner.bump & MINER_FLAG_REFERRAL == 0 {
+        return Ok(None);
+    }
+    let info = referral_info.ok_or(MinerError::ReferralAccountRequired)?;
+    expect_writable(info)?;
+    expect_program_account(info, REFERRAL_DISCRIMINATOR)?;
+    let referral = read_state::<Referral>(info)?;
+    if referral.authority != miner.authority {
+        return Err(MinerError::InvalidAccount.into());
+    }
+    Ok(Some(referral))
+}
+
 /// Lazy settlement of the miner's previous round.
 ///
 /// If the miner has unsettled weight from a round < current_round:
 /// - matching round account given -> pending += budget * weight / total_weight
 /// - round already closed (empty account) and retention passed -> reward lapses
 /// - otherwise -> SettlementRequired error
+///
+/// For an enrolled miner the reward slice earned by the (boosted) token
+/// weight of that submit is charged the full ladder total
+/// (REFERRAL_TOTAL_BPS), accrued in Referral.pending_commission and
+/// distributed across the referral chain at the referee's next claim
+/// (shares of missing levels burn there). The base-weight slice is never
+/// charged.
 pub fn settle_previous_round(
     miner: &mut Miner,
+    mut referral: Option<&mut Referral>,
     current_round: u64,
     prev_round_info: &AccountInfo,
 ) -> ProgramResult {
@@ -182,6 +211,9 @@ pub fn settle_previous_round(
         // Round account closed after retention: the reward lapses.
         if miner.last_round.saturating_add(ROUND_RETENTION) <= current_round {
             miner.last_round_weight = 0;
+            if let Some(r) = referral {
+                r.last_token_weight = 0;
+            }
             return Ok(());
         }
         return Err(MinerError::SettlementRequired.into());
@@ -196,12 +228,33 @@ pub fn settle_previous_round(
             .checked_mul(miner.last_round_weight as u128)
             .ok_or(MinerError::Overflow)?
             / (round.total_weight as u128);
+        let mut commission = 0u64;
+        if let Some(r) = referral.as_deref_mut() {
+            // last_token_weight was recorded by the same submit that set
+            // last_round_weight (both are zeroed together below); a submit
+            // made before enrollment simply has it at 0 -> no commission.
+            let token_weight = r.last_token_weight.min(miner.last_round_weight);
+            let token_reward = reward
+                .checked_mul(token_weight as u128)
+                .ok_or(MinerError::Overflow)?
+                / (miner.last_round_weight as u128);
+            commission = (token_reward * (REFERRAL_TOTAL_BPS as u128)
+                / (BPS_DENOM as u128)) as u64;
+            r.pending_commission = r
+                .pending_commission
+                .checked_add(commission)
+                .ok_or(MinerError::Overflow)?;
+        }
+        // commission <= 9% of the reward, so the subtraction cannot underflow.
         miner.pending_rewards = miner
             .pending_rewards
-            .checked_add(reward as u64)
+            .checked_add(reward as u64 - commission)
             .ok_or(MinerError::Overflow)?;
     }
     miner.last_round_weight = 0;
+    if let Some(r) = referral {
+        r.last_token_weight = 0;
+    }
     Ok(())
 }
 

@@ -46,7 +46,9 @@ pub fn process(accounts: &[AccountInfo]) -> ProgramResult {
             index: new_index,
             total_weight: 0,
             start_ts: now,
-            budget: round_budget(config.round_seconds),
+            // Halving-aware budget, frozen for the round's lifetime like
+            // before (later halvings never touch already-open rounds).
+            budget: round_budget_at(config.round_seconds, now),
         },
     )?;
 
