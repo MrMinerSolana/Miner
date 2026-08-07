@@ -42,14 +42,19 @@ fn main() {
         "claim" => cmd_claim(&ctx),
         "set-referrer" => cmd_set_referrer(&ctx, &args[2..]),
         "set-refname" => cmd_set_refname(&ctx, &args[2..]),
+        "lock" => cmd_lock(&ctx, &args[2..]),
+        "unlock" => cmd_unlock(&ctx),
         "update-config" => cmd_update_config(&ctx, &args[2..]),
         "set-admin" => cmd_set_admin(&ctx, &args[2..]),
         _ => {
-            eprintln!("usage: miner <init|status|mine|crank|claim|set-referrer|set-refname|update-config|set-admin>");
+            eprintln!("usage: miner <init|status|mine|crank|claim|set-referrer|set-refname|lock|unlock|update-config|set-admin>");
             eprintln!("  set-referrer <name_or_pubkey>    (once, immutable: +15% token weight,");
             eprintln!("                                    5/3/1% of token rewards up the chain)");
             eprintln!("  set-refname <name>               (once, immutable: your custom referral");
             eprintln!("                                    code, 3-16 chars a-z 0-9 _)");
+            eprintln!("  lock <amount_tokens> <days>      (lock-to-boost: 7 d = 1.2x, 30 d = 1.5x,");
+            eprintln!("                                    90 d = 2.0x weight; top-up re-locks all)");
+            eprintln!("  unlock                           (withdraw an expired lock)");
             eprintln!("  update-config <min_difficulty> <base_weight_tokens> <round_seconds>");
             eprintln!("  set-admin <new_admin_pubkey>");
             std::process::exit(1);
@@ -352,6 +357,24 @@ fn cmd_status(ctx: &Ctx) {
                 ),
                 None => println!("your ref link: https://miner.tools/?ref={me}"),
             }
+            if let Some(l) = ctx.read::<Lock>(&pda::lock_pda(&me).0) {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let now =
+                    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+                if now < l.unlock_ts {
+                    println!(
+                        "lock:          {:.4} tokens at {:.1}x weight | unlocks in ~{:.1} d",
+                        l.amount as f64 / ONE_TOKEN as f64,
+                        l.multiplier_bps as f64 / BPS_DENOM as f64,
+                        (l.unlock_ts - now) as f64 / 86_400.0
+                    );
+                } else {
+                    println!(
+                        "lock:          {:.4} tokens EXPIRED (1x weight), run `miner unlock`",
+                        l.amount as f64 / ONE_TOKEN as f64
+                    );
+                }
+            }
         }
         None => println!("miner: not registered (happens automatically on `miner mine`)"),
     }
@@ -400,6 +423,9 @@ fn cmd_mine(ctx: &Ctx) {
         } else {
             sdk::mine(me, me, mint, config.current_round, miner.last_round, nonce)
         };
+        // The lock PDA rides along unconditionally: the program ignores it
+        // while empty and counts the locked tokens once a lock exists.
+        let ix = sdk::with_lock(ix, &me);
         match ctx.send(&[ix], &[]) {
             Ok(()) => {
                 let m: Miner = ctx.read(&miner_pda).unwrap();
@@ -569,6 +595,64 @@ fn cmd_set_refname(ctx: &Ctx, args: &[String]) {
     ctx.send(&[sdk::set_refname(me, &name)], &[])
         .expect("set_refname failed");
     println!("OK: your referral link is https://miner.tools/?ref={name}");
+}
+
+/// Lock-to-boost: locks tokens in the program vault for a weight
+/// multiplier. Topping up re-locks everything under the newly chosen tier.
+fn cmd_lock(ctx: &Ctx, args: &[String]) {
+    if args.len() != 2 {
+        eprintln!("usage: miner lock <amount_tokens> <days>  (7 = 1.2x, 30 = 1.5x, 90 = 2.0x)");
+        std::process::exit(1);
+    }
+    let amount_tokens: f64 = args[0].parse().expect("amount: token amount");
+    let days: i64 = args[1].parse().expect("days: number");
+    let duration = days * 86_400;
+    let Some(multiplier) = lock_multiplier_bps(duration) else {
+        let tiers: Vec<String> = LOCK_TIERS
+            .iter()
+            .map(|(d, m)| format!("{} d = {:.1}x", d / 86_400, *m as f64 / BPS_DENOM as f64))
+            .collect();
+        eprintln!("invalid tier; available: {}", tiers.join(", "));
+        std::process::exit(1);
+    };
+    let amount = (amount_tokens * ONE_TOKEN as f64) as u64;
+    let me = ctx.payer.pubkey();
+    let config = ctx.config();
+    let mint = Pubkey::new_from_array(config.mint);
+    let (lock_key, _) = pda::lock_pda(&me);
+
+    // The vault (the lock PDA's ATA) rides in the same transaction.
+    let ixs = vec![
+        ix_create_ata_idempotent(&me, &lock_key, &mint),
+        sdk::lock(me, mint, amount, duration),
+    ];
+    ctx.send(&ixs, &[]).expect("lock failed");
+    let lock: Lock = ctx.read(&pda::lock_pda(&me).0).expect("lock account");
+    println!(
+        "OK: {:.4} tokens locked at {:.1}x weight for {} days (total {:.4})",
+        amount_tokens,
+        multiplier as f64 / BPS_DENOM as f64,
+        days,
+        lock.amount as f64 / ONE_TOKEN as f64
+    );
+}
+
+/// Withdraws an expired lock (tokens + both rents back to the wallet).
+fn cmd_unlock(ctx: &Ctx) {
+    let me = ctx.payer.pubkey();
+    let config = ctx.config();
+    let mint = Pubkey::new_from_array(config.mint);
+    let ixs = vec![
+        ix_create_ata_idempotent(&me, &me, &mint),
+        sdk::unlock(me, mint),
+    ];
+    ctx.send(&ixs, &[]).expect("unlock failed");
+    let balance = ctx
+        .rpc
+        .get_token_account_balance(&pda::ata(&me, &mint))
+        .map(|b| b.ui_amount_string)
+        .unwrap_or_default();
+    println!("OK: lock withdrawn, token balance {balance}");
 }
 
 /// Admin: change parameters (difficulty, base weight, round length).

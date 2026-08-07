@@ -41,6 +41,19 @@ pub fn expect_writable(info: &AccountInfo) -> ProgramResult {
     Ok(())
 }
 
+/// Discriminator of an initialized account owned by this program (used to
+/// tell trailing Referral/Lock accounts apart in Mine).
+pub fn program_account_discriminator(info: &AccountInfo) -> Result<u64, ProgramError> {
+    if info.owner.ne(&miner_api::id()) {
+        return Err(MinerError::InvalidAccount.into());
+    }
+    let data = info.try_borrow_data()?;
+    if data.len() < 8 {
+        return Err(MinerError::InvalidDiscriminator.into());
+    }
+    Ok(u64::from_le_bytes(data[..8].try_into().unwrap()))
+}
+
 pub fn expect_program_account(info: &AccountInfo, discriminator: u64) -> ProgramResult {
     if info.owner.ne(&miner_api::id()) {
         return Err(MinerError::InvalidAccount.into());
@@ -183,6 +196,37 @@ pub fn load_referral(
         return Err(MinerError::InvalidAccount.into());
     }
     Ok(Some(referral))
+}
+
+/// Loads the miner's Lock account when the trailing account was given.
+/// Purely optional: without it the locked tokens simply do not count that
+/// submit (the miner can only hurt themselves by omitting it).
+pub fn load_lock(
+    miner: &Miner,
+    lock_info: Option<&AccountInfo>,
+) -> Result<Option<Lock>, ProgramError> {
+    let Some(info) = lock_info else {
+        return Ok(None);
+    };
+    expect_program_account(info, LOCK_DISCRIMINATOR)?;
+    let lock = read_state::<Lock>(info)?;
+    if lock.authority != miner.authority {
+        return Err(MinerError::InvalidAccount.into());
+    }
+    Ok(Some(lock))
+}
+
+/// Weight contributed by a lock at time `now`: the amount multiplied by the
+/// tier while active, the plain amount once expired (still in the vault, so
+/// it cannot cycle either way).
+pub fn locked_weight(lock: Option<&Lock>, now: i64) -> u64 {
+    match lock {
+        Some(l) if now < l.unlock_ts => {
+            ((l.amount as u128) * (l.multiplier_bps as u128) / (BPS_DENOM as u128)) as u64
+        }
+        Some(l) => l.amount,
+        None => 0,
+    }
 }
 
 /// Lazy settlement of the miner's previous round.

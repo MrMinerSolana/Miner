@@ -37,6 +37,13 @@ pub enum MinerError {
     ReferralAccountRequired = 14,
     /// Referral name outside the 3-16 length bound or the a-z 0-9 _ charset.
     InvalidName = 15,
+    /// Lock duration is not a valid tier, or the top-up would shorten the
+    /// existing lock.
+    InvalidLockDuration = 16,
+    /// Creating a lock requires a nonzero amount.
+    InvalidLockAmount = 17,
+    /// The lock has not expired yet.
+    LockNotExpired = 18,
 }
 
 impl From<MinerError> for ProgramError {

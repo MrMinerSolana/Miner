@@ -24,6 +24,9 @@ pub enum MinerInstruction {
     /// Accounts: [signer (authority or session), miner, config,
     ///           current_round, prev_round, token_account (authority ATA),
     ///           slot_hashes]
+    /// Trailing accounts (any order, told apart by discriminator): the
+    /// Referral PDA (required once enrolled) and/or the Lock PDA (optional;
+    /// without it the locked tokens simply do not count that submit).
     /// Data: nonce u64 LE
     Mine = 3,
 
@@ -68,6 +71,28 @@ pub enum MinerInstruction {
     ///           refname_owner (PDA), system_program]
     /// Data: the name (3-16 bytes, lowercase a-z 0-9 _)
     SetRefName = 10,
+
+    /// Lock tokens for a mining weight multiplier (lock-to-boost). Creates
+    /// or tops up the "lock" PDA and moves the tokens into its vault (the
+    /// lock PDA's ATA, created client-side beforehand). Topping up re-locks
+    /// the whole amount: the new now + duration must not come before the
+    /// current unlock timestamp. Mine then takes the Lock account as a
+    /// trailing account (see Mine) so the locked amount counts with the
+    /// tier multiplier. Must be signed by the authority itself.
+    /// Accounts: [authority (signer, payer), lock (PDA), user token
+    ///           account, vault (lock PDA's ATA), config, token_program,
+    ///           system_program]
+    /// Data: amount u64 LE, duration_secs i64 LE (an exact LOCK_TIERS
+    /// entry)
+    Lock = 11,
+
+    /// Withdraw an expired lock: transfers the vault balance back to the
+    /// user, closes the vault and the lock PDA (rent back to the
+    /// authority). Must be signed by the authority itself.
+    /// Accounts: [authority (signer), lock (PDA), vault (lock PDA's ATA,
+    ///           pinned to config.mint), user token account, config,
+    ///           token_program]
+    Unlock = 12,
 }
 
 impl MinerInstruction {
@@ -84,6 +109,8 @@ impl MinerInstruction {
             8 => Self::SetAdmin,
             9 => Self::SetReferrer,
             10 => Self::SetRefName,
+            11 => Self::Lock,
+            12 => Self::Unlock,
             _ => return None,
         })
     }

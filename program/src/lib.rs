@@ -4,11 +4,13 @@ mod close_round;
 mod crank;
 mod initialize;
 mod loaders;
+mod lock;
 mod mine;
 mod register;
 mod set_admin;
 mod set_referrer;
 mod set_refname;
+mod unlock;
 mod update_config;
 
 use miner_api::instruction::MinerInstruction;
@@ -45,5 +47,7 @@ pub fn process_instruction(
         MinerInstruction::SetAdmin => set_admin::process(accounts, rest),
         MinerInstruction::SetReferrer => set_referrer::process(accounts),
         MinerInstruction::SetRefName => set_refname::process(accounts, rest),
+        MinerInstruction::Lock => lock::process(accounts, rest),
+        MinerInstruction::Unlock => unlock::process(accounts),
     }
 }

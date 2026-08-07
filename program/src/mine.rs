@@ -1,7 +1,7 @@
 use miner_api::{consts::*, error::MinerError, sdk, state::*};
 use solana_program::{
-    account_info::AccountInfo, entrypoint::ProgramResult, keccak,
-    program_error::ProgramError,
+    account_info::AccountInfo, clock::Clock, entrypoint::ProgramResult, keccak,
+    program_error::ProgramError, sysvar::Sysvar,
 };
 
 use crate::loaders::*;
@@ -11,23 +11,40 @@ use crate::loaders::*;
 /// 1. Signature check (authority or session key).
 /// 2. Lazy settlement of the previous round (accrues pending_rewards).
 /// 3. PoW check: keccak(challenge, authority, nonce) >= min_difficulty.
-/// 4. Weight = base_weight + min(balance now, balance at previous submit).
+/// 4. Weight = base_weight + min(balance now, balance at previous submit)
+///    + locked tokens (times the tier multiplier while the lock is active).
 ///    Min-balance rule: freshly bought/transferred tokens only count from
 ///    the next round -> cycling tokens between wallets and flash balances
-///    do not increase weight.
+///    do not increase weight. Locked tokens are exempt: they sit in the
+///    program vault and physically cannot cycle, so they count right away.
 ///    Referral bonus: for an enrolled miner (trailing referral account,
-///    required by the flag in Miner.bump) the token slice of the weight is
-///    boosted by REFERRAL_BONUS_BPS. The bonus is applied after the
-///    min-balance rule, so the anti-cycling guarantee is unchanged.
+///    required by the flag in Miner.bump) the token slice of the weight
+///    (wallet + locked) is boosted by REFERRAL_BONUS_BPS. The bonus is
+///    applied after the min-balance rule, so the anti-cycling guarantee is
+///    unchanged.
 /// 5. Add the weight to the round and roll the challenge.
 pub fn process(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    // 7 accounts (legacy, miners not enrolled in the referral program) or 8
-    // (trailing referral account).
-    let (fixed_accounts, referral_info) = match accounts.len() {
-        7 => (accounts, None),
-        8 => (&accounts[..7], Some(&accounts[7])),
-        _ => return Err(ProgramError::NotEnoughAccountKeys),
-    };
+    // 7 fixed accounts, then up to two trailing program accounts told apart
+    // by their discriminator: the Referral PDA (required once enrolled) and
+    // the Lock PDA (optional, adds the locked tokens to the weight).
+    if accounts.len() < 7 || accounts.len() > 9 {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    }
+    let (fixed_accounts, trailing) = accounts.split_at(7);
+    let mut referral_info = None;
+    let mut lock_info = None;
+    for info in trailing {
+        // A nonexistent trailing account is ignored, so clients may always
+        // append the (possibly empty) referral / lock PDA slots.
+        if info.owner.ne(&miner_api::id()) || info.data_is_empty() {
+            continue;
+        }
+        match program_account_discriminator(info)? {
+            REFERRAL_DISCRIMINATOR if referral_info.is_none() => referral_info = Some(info),
+            LOCK_DISCRIMINATOR if lock_info.is_none() => lock_info = Some(info),
+            _ => return Err(MinerError::InvalidAccount.into()),
+        }
+    }
     let [signer_info, miner_info, config_info, current_round_info, prev_round_info, token_account_info, slot_hashes_info] =
         fixed_accounts
     else {
@@ -92,9 +109,17 @@ pub fn process(accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     // Token balance (the account may not exist -> free tier, balance 0).
     let balance = read_token_balance(token_account_info, &config.mint, &miner.authority)?;
 
-    // Weight: base + min(balance, previous balance), the token slice boosted
-    // by the referral bonus for enrolled miners.
-    let counted_balance = balance.min(miner.last_balance);
+    // Locked tokens (multiplied while the lock is active).
+    let lock = load_lock(&miner, lock_info)?;
+    let now = Clock::get()?.unix_timestamp;
+    let lock_weight = locked_weight(lock.as_ref(), now);
+
+    // Weight: base + min(balance, previous balance) + locked tokens, the
+    // whole token slice boosted by the referral bonus for enrolled miners.
+    let counted_balance = balance
+        .min(miner.last_balance)
+        .checked_add(lock_weight)
+        .ok_or(MinerError::Overflow)?;
     let token_weight = match referral.as_mut() {
         Some(r) => {
             let boosted = ((counted_balance as u128)

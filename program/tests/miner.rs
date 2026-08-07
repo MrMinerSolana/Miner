@@ -1243,3 +1243,358 @@ fn test_refname_validation() {
     )
     .expect("a 16-char name works");
 }
+
+// ---------- lock-to-boost ----------
+
+fn get_lock(svm: &LiteSVM, authority: &Pubkey) -> Lock {
+    get_state(svm, &pda::lock_pda(authority).0)
+}
+
+/// Creates the per-user lock vault (the lock PDA's ATA) with a zero
+/// balance, the same way clients ride an idempotent create-ATA instruction
+/// in front of the Lock instruction.
+fn create_lock_vault(svm: &mut LiteSVM, mint: &Pubkey, authority: &Pubkey) {
+    let (lock_key, _) = pda::lock_pda(authority);
+    let vault = pda::ata(&lock_key, mint);
+    if svm.get_account(&vault).is_none() {
+        svm.set_account(vault, token_account(mint, &lock_key, 0))
+            .unwrap();
+    }
+}
+
+fn lock_tokens(
+    svm: &mut LiteSVM,
+    authority: &Keypair,
+    mint: &Pubkey,
+    amount: u64,
+    duration: i64,
+) -> Result<(), String> {
+    create_lock_vault(svm, mint, &authority.pubkey());
+    send(
+        svm,
+        &[sdk::lock(authority.pubkey(), *mint, amount, duration)],
+        authority,
+        &[],
+    )
+}
+
+/// Mine with the trailing Lock account (a miner not enrolled in referrals).
+fn mine_lock(svm: &mut LiteSVM, authority: &Keypair, mint: &Pubkey) -> Result<(), String> {
+    let config = get_config(svm);
+    let miner = get_miner(svm, &authority.pubkey());
+    let nonce = grind(svm, &authority.pubkey());
+    let ix = sdk::with_lock(
+        sdk::mine(
+            authority.pubkey(),
+            authority.pubkey(),
+            *mint,
+            config.current_round,
+            miner.last_round,
+            nonce,
+        ),
+        &authority.pubkey(),
+    );
+    send(svm, &[ix], authority, &[])
+}
+
+/// True when the account is gone (closed accounts may linger as
+/// zero-lamport shells until the slot ends).
+fn account_closed(svm: &LiteSVM, key: &Pubkey) -> bool {
+    svm.get_account(key).map_or(true, |a| a.lamports == 0)
+}
+
+#[test]
+fn test_lock_boost_full_flow() {
+    let (mut svm, admin, mint) = setup();
+    let alice = Keypair::new();
+    register_miner(&mut svm, &alice);
+    set_balance(&mut svm, &mint, &alice.pubkey(), 100 * ONE_TOKEN);
+
+    let (duration, multiplier) = LOCK_TIERS[2]; // 90 days -> 2.0x
+    lock_tokens(&mut svm, &alice, &mint, 40 * ONE_TOKEN, duration).expect("lock");
+
+    // The tokens moved into the vault and the lock records the tier.
+    assert_eq!(token_balance(&svm, &mint, &alice.pubkey()), 60 * ONE_TOKEN);
+    let (lock_key, _) = pda::lock_pda(&alice.pubkey());
+    let vault = pda::ata(&lock_key, &mint);
+    let vault_acc = svm.get_account(&vault).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(vault_acc.data[64..72].try_into().unwrap()),
+        40 * ONE_TOKEN
+    );
+    let lock = get_lock(&svm, &alice.pubkey());
+    assert_eq!(lock.amount, 40 * ONE_TOKEN);
+    assert_eq!(lock.multiplier_bps, multiplier);
+
+    // First submit: the wallet balance waits a round (min-balance rule) but
+    // the locked tokens count immediately, times the multiplier.
+    mine_lock(&mut svm, &alice, &mint).expect("mine 1");
+    let round = get_round(&svm, get_config(&svm).current_round);
+    assert_eq!(round.total_weight, INITIAL_BASE_WEIGHT + 80 * ONE_TOKEN);
+
+    // Second round: the wallet balance joins in on top.
+    advance_round(&mut svm, &admin);
+    mine_lock(&mut svm, &alice, &mint).expect("mine 2");
+    let round = get_round(&svm, get_config(&svm).current_round);
+    assert_eq!(
+        round.total_weight,
+        INITIAL_BASE_WEIGHT + 60 * ONE_TOKEN + 80 * ONE_TOKEN
+    );
+
+    // Unlock before expiry is rejected.
+    let err = send(&mut svm, &[sdk::unlock(alice.pubkey(), mint)], &alice, &[])
+        .expect_err("unlock too early must fail");
+    assert!(err.contains("Custom(18)"), "expected LockNotExpired: {err}");
+
+    // Past expiry the whole stash comes back and both accounts close.
+    let lock = get_lock(&svm, &alice.pubkey());
+    warp_to(&mut svm, lock.unlock_ts + 1);
+    send(&mut svm, &[sdk::unlock(alice.pubkey(), mint)], &alice, &[]).expect("unlock");
+    assert_eq!(token_balance(&svm, &mint, &alice.pubkey()), 100 * ONE_TOKEN);
+    assert!(account_closed(&svm, &pda::lock_pda(&alice.pubkey()).0));
+    assert!(account_closed(&svm, &vault));
+}
+
+#[test]
+fn test_lock_tiers_and_topup() {
+    let (mut svm, _admin, mint) = setup();
+    let alice = Keypair::new();
+    register_miner(&mut svm, &alice);
+    set_balance(&mut svm, &mint, &alice.pubkey(), 100 * ONE_TOKEN);
+
+    // A duration outside the tiers is rejected.
+    let err = lock_tokens(&mut svm, &alice, &mint, ONE_TOKEN, 86_400)
+        .expect_err("a non-tier duration must fail");
+    assert!(err.contains("Custom(16)"), "expected InvalidLockDuration: {err}");
+
+    // Creating a lock with a zero amount is rejected.
+    let err = lock_tokens(&mut svm, &alice, &mint, 0, LOCK_TIERS[0].0)
+        .expect_err("a zero-amount create must fail");
+    assert!(err.contains("Custom(17)"), "expected InvalidLockAmount: {err}");
+
+    // Create at the 90-day tier; a 7-day top-up would shorten it: rejected.
+    lock_tokens(&mut svm, &alice, &mint, 10 * ONE_TOKEN, LOCK_TIERS[2].0).expect("lock");
+    let err = lock_tokens(&mut svm, &alice, &mint, 5 * ONE_TOKEN, LOCK_TIERS[0].0)
+        .expect_err("a shortening top-up must fail");
+    assert!(err.contains("Custom(16)"), "expected InvalidLockDuration: {err}");
+
+    // A same-tier top-up accumulates the amount and extends the clock.
+    let before = get_lock(&svm, &alice.pubkey());
+    lock_tokens(&mut svm, &alice, &mint, 5 * ONE_TOKEN, LOCK_TIERS[2].0).expect("top-up");
+    let after = get_lock(&svm, &alice.pubkey());
+    assert_eq!(after.amount, 15 * ONE_TOKEN);
+    assert!(after.unlock_ts >= before.unlock_ts);
+    assert_eq!(token_balance(&svm, &mint, &alice.pubkey()), 85 * ONE_TOKEN);
+
+    // Near expiry a shorter tier covers the remainder, so re-tiering (here
+    // a pure extension with amount 0) is allowed; the multiplier follows.
+    let warp_ts = after.unlock_ts - 86_400;
+    warp_to(&mut svm, warp_ts);
+    lock_tokens(&mut svm, &alice, &mint, 0, LOCK_TIERS[0].0).expect("re-tier");
+    let lock = get_lock(&svm, &alice.pubkey());
+    assert_eq!(lock.amount, 15 * ONE_TOKEN);
+    assert_eq!(lock.multiplier_bps, LOCK_TIERS[0].1);
+    assert_eq!(lock.unlock_ts, warp_ts + LOCK_TIERS[0].0);
+}
+
+#[test]
+fn test_expired_lock_counts_at_face_value() {
+    let (mut svm, admin, mint) = setup();
+    let alice = Keypair::new();
+    register_miner(&mut svm, &alice);
+    set_balance(&mut svm, &mint, &alice.pubkey(), 50 * ONE_TOKEN);
+    lock_tokens(&mut svm, &alice, &mint, 50 * ONE_TOKEN, LOCK_TIERS[0].0).expect("lock");
+
+    // Active: 50 locked at the 7-day tier (1.2x) -> 60 weight.
+    mine_lock(&mut svm, &alice, &mint).expect("mine while active");
+    let round = get_round(&svm, get_config(&svm).current_round);
+    assert_eq!(round.total_weight, INITIAL_BASE_WEIGHT + 60 * ONE_TOKEN);
+
+    // Past expiry, not withdrawn: the tokens still count, at 1x.
+    let lock = get_lock(&svm, &alice.pubkey());
+    warp_to(&mut svm, lock.unlock_ts + 1);
+    crank_next(&mut svm, &admin);
+    mine_lock(&mut svm, &alice, &mint).expect("mine after expiry");
+    let round = get_round(&svm, get_config(&svm).current_round);
+    assert_eq!(round.total_weight, INITIAL_BASE_WEIGHT + 50 * ONE_TOKEN);
+}
+
+#[test]
+fn test_lock_stacks_with_referral_boost() {
+    let (mut svm, admin, mint) = setup();
+    let referrer = Keypair::new();
+    let bob = Keypair::new();
+    register_miner(&mut svm, &referrer);
+    register_miner(&mut svm, &bob);
+    send(
+        &mut svm,
+        &[sdk::set_referrer(bob.pubkey(), referrer.pubkey())],
+        &bob,
+        &[],
+    )
+    .expect("enroll");
+
+    set_balance(&mut svm, &mint, &bob.pubkey(), 40 * ONE_TOKEN);
+    lock_tokens(&mut svm, &bob, &mint, 40 * ONE_TOKEN, LOCK_TIERS[2].0).expect("lock");
+
+    // An enrolled miner cannot smuggle just the lock account past the
+    // referral bookkeeping.
+    let config = get_config(&svm);
+    let miner = get_miner(&svm, &bob.pubkey());
+    let nonce = grind(&svm, &bob.pubkey());
+    let ix = sdk::with_lock(
+        sdk::mine(
+            bob.pubkey(),
+            bob.pubkey(),
+            mint,
+            config.current_round,
+            miner.last_round,
+            nonce,
+        ),
+        &bob.pubkey(),
+    );
+    let err = send(&mut svm, &[ix], &bob, &[]).expect_err("referral account required");
+    assert!(
+        err.contains("Custom(14)"),
+        "expected ReferralAccountRequired: {err}"
+    );
+
+    // Referral + lock together: the whole token slice (locked, multiplied)
+    // gets the 15% boost, and the commission base records it.
+    let ix = sdk::with_lock(
+        sdk::mine_with_referral(
+            bob.pubkey(),
+            bob.pubkey(),
+            mint,
+            config.current_round,
+            miner.last_round,
+            nonce,
+        ),
+        &bob.pubkey(),
+    );
+    send(&mut svm, &[ix], &bob, &[]).expect("mine with referral + lock");
+    let locked_weight = 40 * ONE_TOKEN * 2;
+    let boosted = locked_weight * (BPS_DENOM + REFERRAL_BONUS_BPS) / BPS_DENOM;
+    let round = get_round(&svm, get_config(&svm).current_round);
+    assert_eq!(round.total_weight, INITIAL_BASE_WEIGHT + boosted);
+    assert_eq!(
+        get_referral(&svm, &bob.pubkey()).last_token_weight,
+        boosted
+    );
+
+    // The trailing accounts are told apart by discriminator, so the
+    // reversed order works just as well.
+    advance_round(&mut svm, &admin);
+    let config = get_config(&svm);
+    let miner = get_miner(&svm, &bob.pubkey());
+    let nonce = grind(&svm, &bob.pubkey());
+    let mut ix = sdk::with_lock(
+        sdk::mine_with_referral(
+            bob.pubkey(),
+            bob.pubkey(),
+            mint,
+            config.current_round,
+            miner.last_round,
+            nonce,
+        ),
+        &bob.pubkey(),
+    );
+    let n = ix.accounts.len();
+    ix.accounts.swap(n - 2, n - 1);
+    send(&mut svm, &[ix], &bob, &[]).expect("swapped trailing order works");
+}
+
+#[test]
+fn test_foreign_lock_rejected() {
+    use solana_sdk::instruction::{AccountMeta, Instruction};
+
+    let (mut svm, _admin, mint) = setup();
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    register_miner(&mut svm, &alice);
+    register_miner(&mut svm, &bob);
+    set_balance(&mut svm, &mint, &bob.pubkey(), 10 * ONE_TOKEN);
+    lock_tokens(&mut svm, &bob, &mint, 10 * ONE_TOKEN, LOCK_TIERS[1].0).expect("bob locks");
+
+    // Alice mining with bob's lock account.
+    let config = get_config(&svm);
+    let miner = get_miner(&svm, &alice.pubkey());
+    let nonce = grind(&svm, &alice.pubkey());
+    let ix = sdk::with_lock(
+        sdk::mine(
+            alice.pubkey(),
+            alice.pubkey(),
+            mint,
+            config.current_round,
+            miner.last_round,
+            nonce,
+        ),
+        &bob.pubkey(),
+    );
+    let err = send(&mut svm, &[ix], &alice, &[]).expect_err("a foreign lock must fail");
+    assert!(err.contains("Custom(1)"), "expected InvalidAccount: {err}");
+
+    // Alice trying to unlock bob's stash into her own wallet.
+    set_balance(&mut svm, &mint, &alice.pubkey(), 0);
+    let (bob_lock, _) = pda::lock_pda(&bob.pubkey());
+    let ix = Instruction {
+        program_id: miner_api::id(),
+        accounts: vec![
+            AccountMeta::new(alice.pubkey(), true),
+            AccountMeta::new(bob_lock, false),
+            AccountMeta::new(pda::ata(&bob_lock, &mint), false),
+            AccountMeta::new(pda::ata(&alice.pubkey(), &mint), false),
+            AccountMeta::new_readonly(pda::config_pda().0, false),
+            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+        ],
+        data: vec![miner_api::instruction::MinerInstruction::Unlock as u8],
+    };
+    let err = send(&mut svm, &[ix], &alice, &[]).expect_err("a foreign unlock must fail");
+    assert!(err.contains("Custom(3)"), "expected Unauthorized: {err}");
+}
+
+#[test]
+fn test_unlock_rejects_non_canonical_vault() {
+    use solana_sdk::instruction::{AccountMeta, Instruction};
+
+    let (mut svm, _admin, mint) = setup();
+    let alice = Keypair::new();
+    register_miner(&mut svm, &alice);
+    set_balance(&mut svm, &mint, &alice.pubkey(), 10 * ONE_TOKEN);
+    lock_tokens(&mut svm, &alice, &mint, 10 * ONE_TOKEN, LOCK_TIERS[0].0).expect("lock");
+
+    // A second token account owned by the lock PDA, at a non-ATA address.
+    // Passing it as the vault must not be able to close the lock while the
+    // real vault still holds the deposit.
+    let (lock_key, _) = pda::lock_pda(&alice.pubkey());
+    let decoy = Pubkey::new_unique();
+    svm.set_account(decoy, token_account(&mint, &lock_key, ONE_TOKEN))
+        .unwrap();
+
+    let lock = get_lock(&svm, &alice.pubkey());
+    warp_to(&mut svm, lock.unlock_ts + 1);
+
+    let ix = Instruction {
+        program_id: miner_api::id(),
+        accounts: vec![
+            AccountMeta::new(alice.pubkey(), true),
+            AccountMeta::new(pda::lock_pda(&alice.pubkey()).0, false),
+            AccountMeta::new(decoy, false),
+            AccountMeta::new(pda::ata(&alice.pubkey(), &mint), false),
+            AccountMeta::new_readonly(pda::config_pda().0, false),
+            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+        ],
+        data: vec![miner_api::instruction::MinerInstruction::Unlock as u8],
+    };
+    let err = send(&mut svm, &[ix], &alice, &[]).expect_err("a decoy vault must fail");
+    assert!(err.contains("Custom(1)"), "expected InvalidAccount: {err}");
+
+    // The canonical unlock still works and returns the full deposit.
+    send(&mut svm, &[sdk::unlock(alice.pubkey(), mint)], &alice, &[]).expect("unlock");
+    assert_eq!(token_balance(&svm, &mint, &alice.pubkey()), 10 * ONE_TOKEN);
+    assert!(account_closed(&svm, &pda::lock_pda(&alice.pubkey()).0));
+
+    // A second unlock has nothing to work on and fails cleanly.
+    send(&mut svm, &[sdk::unlock(alice.pubkey(), mint)], &alice, &[])
+        .expect_err("double unlock must fail");
+}

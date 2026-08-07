@@ -173,6 +173,32 @@ const _REFEREE_NET_POSITIVE: () = assert!(
 /// Referral account, otherwise commissions could be skipped.
 pub const MINER_FLAG_REFERRAL: u64 = 1 << 8;
 
+/// Lock-to-boost: tokens locked in a program vault (the "lock" PDA's ATA)
+/// count toward the mining weight with a multiplier while the lock is
+/// active. Tiers: (duration in seconds, weight multiplier in bps); the
+/// duration sent to Lock must match a tier exactly. An expired lock that
+/// has not been withdrawn counts at 1x, like a plain wallet balance.
+/// Locked tokens physically cannot move between wallets, so they are
+/// exempt from the min-balance (anti-cycling) rule by construction, and
+/// they count from the very next submit.
+pub const LOCK_TIERS: [(i64, u64); 3] = [
+    (7 * 86_400, 12_000),  // 7 days  -> 1.2x
+    (30 * 86_400, 15_000), // 30 days -> 1.5x
+    (90 * 86_400, 20_000), // 90 days -> 2.0x
+];
+
+/// Multiplier for an exact tier duration (None = not a valid tier).
+pub const fn lock_multiplier_bps(duration_secs: i64) -> Option<u64> {
+    let mut i = 0;
+    while i < LOCK_TIERS.len() {
+        if LOCK_TIERS[i].0 == duration_secs {
+            return Some(LOCK_TIERS[i].1);
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Custom referral name (vanity code) length bounds. Charset: a-z 0-9 _
 /// (lowercase only, clients normalize before sending). First come, first
 /// served; one name per miner; immutable. Rent makes mass squatting cost
@@ -186,6 +212,7 @@ pub const TREASURY_SEED: &[u8] = b"treasury";
 pub const ROUND_SEED: &[u8] = b"round";
 pub const MINER_SEED: &[u8] = b"miner";
 pub const REFERRAL_SEED: &[u8] = b"referral";
+pub const LOCK_SEED: &[u8] = b"lock";
 /// name -> owner (uniqueness + resolution of ?ref=<name> links).
 pub const REFNAME_SEED: &[u8] = b"refname";
 /// owner -> name (reverse lookup for UI + enforces one name per miner).
@@ -201,3 +228,9 @@ pub const SLOT_HASHES_SYSVAR_ID: Pubkey =
 
 /// MintTo instruction index in the SPL Token program.
 pub const SPL_TOKEN_MINT_TO_IX: u8 = 7;
+
+/// Transfer instruction index in the SPL Token program.
+pub const SPL_TOKEN_TRANSFER_IX: u8 = 3;
+
+/// CloseAccount instruction index in the SPL Token program.
+pub const SPL_TOKEN_CLOSE_ACCOUNT_IX: u8 = 9;

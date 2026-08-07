@@ -154,6 +154,60 @@ pub fn claim_with_referral(
     ix
 }
 
+/// Appends the miner's Lock PDA to a mine instruction (either variant), so
+/// the locked tokens count toward the weight with the tier multiplier.
+pub fn with_lock(mut ix: Instruction, authority: &Pubkey) -> Instruction {
+    ix.accounts
+        .push(AccountMeta::new_readonly(pda::lock_pda(authority).0, false));
+    ix
+}
+
+/// Lock tokens for a weight multiplier (creates or tops up the lock). The
+/// vault (the lock PDA's ATA) must exist; clients prepend an idempotent
+/// create-ATA instruction in the same transaction.
+pub fn lock(authority: Pubkey, mint: Pubkey, amount: u64, duration_secs: i64) -> Instruction {
+    let (lock, _) = pda::lock_pda(&authority);
+    let (config, _) = pda::config_pda();
+    let user_token = pda::ata(&authority, &mint);
+    let vault = pda::ata(&lock, &mint);
+    let mut data = vec![MinerInstruction::Lock as u8];
+    data.extend_from_slice(&amount.to_le_bytes());
+    data.extend_from_slice(&duration_secs.to_le_bytes());
+    Instruction {
+        program_id: crate::id(),
+        accounts: vec![
+            AccountMeta::new(authority, true),
+            AccountMeta::new(lock, false),
+            AccountMeta::new(user_token, false),
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(config, false),
+            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+        ],
+        data,
+    }
+}
+
+/// Withdraw an expired lock (returns the tokens, closes the vault and the
+/// lock PDA, rent back to the authority).
+pub fn unlock(authority: Pubkey, mint: Pubkey) -> Instruction {
+    let (lock, _) = pda::lock_pda(&authority);
+    let user_token = pda::ata(&authority, &mint);
+    let vault = pda::ata(&lock, &mint);
+    Instruction {
+        program_id: crate::id(),
+        accounts: vec![
+            AccountMeta::new(authority, true),
+            AccountMeta::new(lock, false),
+            AccountMeta::new(vault, false),
+            AccountMeta::new(user_token, false),
+            AccountMeta::new_readonly(pda::config_pda().0, false),
+            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+        ],
+        data: vec![MinerInstruction::Unlock as u8],
+    }
+}
+
 /// Referral enrollment (once, immutable). The referrer must be registered.
 pub fn set_referrer(authority: Pubkey, referrer: Pubkey) -> Instruction {
     let (miner, _) = pda::miner_pda(&authority);

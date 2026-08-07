@@ -6,6 +6,7 @@ pub const ROUND_DISCRIMINATOR: u64 = 2;
 pub const MINER_DISCRIMINATOR: u64 = 3;
 pub const REFERRAL_DISCRIMINATOR: u64 = 4;
 pub const REFNAME_DISCRIMINATOR: u64 = 5;
+pub const LOCK_DISCRIMINATOR: u64 = 6;
 
 /// Global program configuration ("config" PDA, singleton).
 #[repr(C)]
@@ -108,6 +109,30 @@ pub struct Referral {
     pub bump: u64,
 }
 
+/// Token lock ("lock" PDA + authority), created by Lock, closed by Unlock.
+/// The locked tokens sit in the lock PDA's associated token account (the
+/// per-user vault), so every user's tokens are isolated and only this PDA
+/// can move them. While now < unlock_ts the amount counts toward the
+/// mining weight multiplied by multiplier_bps; after expiry it counts at
+/// 1x until withdrawn.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct Lock {
+    pub discriminator: u64,
+    /// Owner wallet (matches Miner.authority).
+    pub authority: [u8; 32],
+    /// Locked amount in native units (mirrors the vault balance).
+    pub amount: u64,
+    /// Unix time when withdrawal opens. Topping up re-locks everything:
+    /// the new now + duration must not come before the current value.
+    pub unlock_ts: i64,
+    /// Weight multiplier in bps while the lock is active (a LOCK_TIERS
+    /// value; set from the tier chosen at the last Lock call).
+    pub multiplier_bps: u64,
+    /// PDA bump.
+    pub bump: u64,
+}
+
 /// Custom referral name (vanity code), created by SetRefName. The same
 /// struct backs BOTH directions of the mapping:
 /// - "refname" PDA + name: uniqueness + resolving ?ref=<name> to a wallet,
@@ -147,4 +172,7 @@ impl Round {
 }
 impl Miner {
     pub const SIZE: usize = core::mem::size_of::<Miner>();
+}
+impl Lock {
+    pub const SIZE: usize = core::mem::size_of::<Lock>();
 }
