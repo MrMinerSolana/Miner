@@ -1,5 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 
+use crate::consts::MOTHERLODE_WINNERS;
+
 /// Account discriminators.
 pub const CONFIG_DISCRIMINATOR: u64 = 1;
 pub const ROUND_DISCRIMINATOR: u64 = 2;
@@ -7,6 +9,8 @@ pub const MINER_DISCRIMINATOR: u64 = 3;
 pub const REFERRAL_DISCRIMINATOR: u64 = 4;
 pub const REFNAME_DISCRIMINATOR: u64 = 5;
 pub const LOCK_DISCRIMINATOR: u64 = 6;
+pub const MOTHERLODE_DISCRIMINATOR: u64 = 7;
+pub const WIN_DISCRIMINATOR: u64 = 8;
 
 /// Global program configuration ("config" PDA, singleton).
 #[repr(C)]
@@ -133,6 +137,63 @@ pub struct Lock {
     pub bump: u64,
 }
 
+/// Motherlode: the protocol strike reward ("motherlode" PDA, singleton
+/// created by InitMotherlode). Accrues MOTHERLODE_BPS of every non-empty
+/// round budget as a counter (nothing is minted up front) and tracks the
+/// current round's strike: every mine instruction is one chance, and each
+/// of the MOTHERLODE_WINNERS candidate slots is maintained with its own
+/// independent reservoir sample so every hash has an equal chance per
+/// slot. The strike roll runs when the crank closes a round (see
+/// crank.rs) and splits the pool evenly across the slots.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct Motherlode {
+    pub discriminator: u64,
+    /// Accumulated pool in native units (minted only when a win is claimed).
+    pub pot: u64,
+    /// Round the hash counter below belongs to (reset on a new round).
+    pub round_index: u64,
+    /// Hashes submitted in round_index (= mine instructions so far).
+    pub hashes: u64,
+    /// Current winner candidates, one independent reservoir sample per
+    /// slot. The same wallet may occupy several slots (it then simply
+    /// receives several shares of the split).
+    pub candidates: [[u8; 32]; MOTHERLODE_WINNERS],
+    /// Lifetime $MINER burned from claimed wins (MOTHERLODE_BURN_BPS each),
+    /// shown by the UI as part of the global burned counter.
+    pub total_burned: u64,
+    /// Lifetime mining fees routed to the fee wallet, in lamports. The
+    /// daily buyback job swaps exactly the day's delta of this counter.
+    pub total_fees: u64,
+    /// The most recent strike (winner wallets, per-winner share, unix
+    /// time), purely informational for the UI; zeroed until the first
+    /// strike ever.
+    pub last_winners: [[u8; 32]; MOTHERLODE_WINNERS],
+    pub last_win_amount: u64,
+    pub last_win_ts: i64,
+    /// PDA bump.
+    pub bump: u64,
+}
+
+/// A won, not-yet-claimed Motherlode strike ("win" PDA + authority),
+/// created by the crank at the strike, closed by ClaimMotherlode (rent
+/// goes to the winner). Wins accumulate: striking again before claiming
+/// simply adds to the amount, and strikes never pause.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct Win {
+    pub discriminator: u64,
+    /// The winning miner (matches Miner.authority).
+    pub authority: [u8; 32],
+    /// Amount waiting to be claimed, native units. At claim
+    /// MOTHERLODE_BURN_BPS of it burns, the rest mints to the winner.
+    pub amount: u64,
+    /// Unix time of the (first unclaimed) strike, for the UI feed.
+    pub since_ts: i64,
+    /// PDA bump.
+    pub bump: u64,
+}
+
 /// Custom referral name (vanity code), created by SetRefName. The same
 /// struct backs BOTH directions of the mapping:
 /// - "refname" PDA + name: uniqueness + resolving ?ref=<name> to a wallet,
@@ -175,4 +236,10 @@ impl Miner {
 }
 impl Lock {
     pub const SIZE: usize = core::mem::size_of::<Lock>();
+}
+impl Motherlode {
+    pub const SIZE: usize = core::mem::size_of::<Motherlode>();
+}
+impl Win {
+    pub const SIZE: usize = core::mem::size_of::<Win>();
 }

@@ -44,6 +44,8 @@ fn main() {
         "set-refname" => cmd_set_refname(&ctx, &args[2..]),
         "lock" => cmd_lock(&ctx, &args[2..]),
         "unlock" => cmd_unlock(&ctx),
+        "init-motherlode" => cmd_init_motherlode(&ctx),
+        "claim-motherlode" => cmd_claim_motherlode(&ctx),
         "update-config" => cmd_update_config(&ctx, &args[2..]),
         "set-admin" => cmd_set_admin(&ctx, &args[2..]),
         _ => {
@@ -55,6 +57,8 @@ fn main() {
             eprintln!("  lock <amount_tokens> <days>      (lock-to-boost: 7 d = 1.2x, 30 d = 1.5x,");
             eprintln!("                                    90 d = 2.0x weight; top-up re-locks all)");
             eprintln!("  unlock                           (withdraw an expired lock)");
+            eprintln!("  claim-motherlode                 (claim a won Motherlode strike;");
+            eprintln!("                                    20% burns, 80% mints to you)");
             eprintln!("  update-config <min_difficulty> <base_weight_tokens> <round_seconds>");
             eprintln!("  set-admin <new_admin_pubkey>");
             std::process::exit(1);
@@ -320,6 +324,15 @@ fn cmd_status(ctx: &Ctx) {
             round.budget as f64 / ONE_TOKEN as f64
         );
     }
+    if let Some(ml) = ctx.read::<Motherlode>(&pda::motherlode_pda().0) {
+        println!(
+            "motherlode:    {:.2} tokens in the pool | 1/{} per round | split {} ways | {} hashes this round",
+            ml.pot as f64 / ONE_TOKEN as f64,
+            MOTHERLODE_ODDS,
+            MOTHERLODE_WINNERS,
+            ml.hashes
+        );
+    }
     let me = ctx.payer.pubkey();
     match ctx.read::<Miner>(&pda::miner_pda(&me).0) {
         Some(m) => {
@@ -356,6 +369,12 @@ fn cmd_status(ctx: &Ctx) {
                     n.name_str()
                 ),
                 None => println!("your ref link: https://miner.tools/?ref={me}"),
+            }
+            if let Some(w) = ctx.read::<Win>(&pda::win_pda(&me).0) {
+                println!(
+                    "MOTHERLODE:    you WON {:.4} tokens! run `miner claim-motherlode`",
+                    w.amount as f64 / ONE_TOKEN as f64
+                );
             }
             if let Some(l) = ctx.read::<Lock>(&pda::lock_pda(&me).0) {
                 use std::time::{SystemTime, UNIX_EPOCH};
@@ -474,7 +493,14 @@ fn cmd_crank(ctx: &Ctx) {
         // separate close after the crank lost to a sniper that was skimming
         // ~1.7 SOL per day). The close is added only when the round account
         // exists, so its absence never blocks opening the new round.
-        let mut ixs = vec![sdk::crank(ctx.payer.pubkey(), next)];
+        // The Motherlode strike roll needs the current candidates' Win PDAs;
+        // a race with a last-second mine (candidate swap) just fails the
+        // crank and the loop retries with a fresh read.
+        let candidates = ctx
+            .read::<Motherlode>(&pda::motherlode_pda().0)
+            .map(|m| m.candidates.map(Pubkey::new_from_array))
+            .unwrap_or_default();
+        let mut ixs = vec![sdk::crank(ctx.payer.pubkey(), next, candidates)];
         if let Some(old) = next.checked_sub(ROUND_RETENTION) {
             if ctx.read::<Round>(&pda::round_pda(old).0).is_some() {
                 ixs.push(sdk::close_round(ctx.payer.pubkey(), old));
@@ -606,7 +632,11 @@ fn cmd_lock(ctx: &Ctx, args: &[String]) {
     }
     let amount_tokens: f64 = args[0].parse().expect("amount: token amount");
     let days: i64 = args[1].parse().expect("days: number");
+    #[cfg(not(feature = "short-lock"))]
     let duration = days * 86_400;
+    // Rehearsal build: the tier argument is given in seconds directly.
+    #[cfg(feature = "short-lock")]
+    let duration = days;
     let Some(multiplier) = lock_multiplier_bps(duration) else {
         let tiers: Vec<String> = LOCK_TIERS
             .iter()
@@ -653,6 +683,43 @@ fn cmd_unlock(ctx: &Ctx) {
         .map(|b| b.ui_amount_string)
         .unwrap_or_default();
     println!("OK: lock withdrawn, token balance {balance}");
+}
+
+/// Ops: creates the Motherlode singleton (permissionless, once).
+fn cmd_init_motherlode(ctx: &Ctx) {
+    ctx.send(&[sdk::init_motherlode(ctx.payer.pubkey())], &[])
+        .expect("init-motherlode failed");
+    println!("OK: motherlode initialized at {}", pda::motherlode_pda().0);
+}
+
+/// Claims a won Motherlode strike: 20% burns, the rest mints to the wallet.
+fn cmd_claim_motherlode(ctx: &Ctx) {
+    let me = ctx.payer.pubkey();
+    let config = ctx.config();
+    let mint = Pubkey::new_from_array(config.mint);
+    let Some(win) = ctx.read::<Win>(&pda::win_pda(&me).0) else {
+        println!("no Motherlode win waiting for {me}");
+        return;
+    };
+    println!(
+        "claiming {:.4} tokens ({:.4} after the {}% burn)…",
+        win.amount as f64 / ONE_TOKEN as f64,
+        (win.amount - win.amount * MOTHERLODE_BURN_BPS / BPS_DENOM) as f64 / ONE_TOKEN as f64,
+        MOTHERLODE_BURN_BPS / 100
+    );
+    let (treasury, _) = pda::treasury_pda();
+    let ixs = vec![
+        ix_create_ata_idempotent(&me, &me, &mint),
+        ix_create_ata_idempotent(&me, &treasury, &mint),
+        sdk::claim_motherlode(me, mint),
+    ];
+    ctx.send(&ixs, &[]).expect("claim-motherlode failed");
+    let balance = ctx
+        .rpc
+        .get_token_account_balance(&pda::ata(&me, &mint))
+        .map(|b| b.ui_amount_string)
+        .unwrap_or_default();
+    println!("OK: token balance {balance}");
 }
 
 /// Admin: change parameters (difficulty, base weight, round length).

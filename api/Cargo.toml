@@ -1,6 +1,6 @@
 [package]
 name = "miner-api"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 description = "Instructions, state and SDK for the MINER protocol - a proof-of-work mined SPL token where holdings boost mining power"
 license = "MIT"
@@ -12,6 +12,14 @@ documentation = "https://miner.tools"
 # so the full schedule can be observed live on a real cluster. NEVER enable
 # for a mainnet artifact.
 short-halving = []
+# Devnet rehearsal build: lock tiers in minutes instead of days, so a full
+# lock -> mine -> expire -> withdraw cycle can be observed live. NEVER
+# enable for a mainnet artifact.
+short-lock = []
+# Devnet rehearsal build: the Motherlode draw strikes on every round close,
+# so the accrue -> win -> claim -> burn cycle can be observed live. NEVER
+# enable for a mainnet artifact.
+short-motherlode = []
 
 [dependencies]
 solana-program = { workspace = true }

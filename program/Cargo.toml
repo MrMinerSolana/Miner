@@ -11,6 +11,10 @@ default = []
 no-entrypoint = []
 # Forwarded to miner-api: devnet rehearsal with 5-minute halvings.
 short-halving = ["miner-api/short-halving"]
+# Forwarded to miner-api: devnet rehearsal with minute-scale lock tiers.
+short-lock = ["miner-api/short-lock"]
+# Forwarded to miner-api: devnet rehearsal with a draw on every round close.
+short-motherlode = ["miner-api/short-motherlode"]
 
 [dependencies]
 miner-api = { workspace = true }

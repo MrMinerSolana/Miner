@@ -18,8 +18,9 @@ const SO_PATH: &str = concat!(
     "/../target/deploy/miner_program.so"
 );
 
-/// Round budget at the default (launch) cadence.
-const DEFAULT_BUDGET: u64 = round_budget(INITIAL_ROUND_SECONDS);
+/// The miners' cut of the round budget at the default (launch) cadence:
+/// what Round.budget stores (the Motherlode share is withheld on top).
+const DEFAULT_BUDGET: u64 = miners_budget(round_budget(INITIAL_ROUND_SECONDS));
 
 // ---------- helpers ----------
 
@@ -61,6 +62,14 @@ fn setup() -> (LiteSVM, Keypair, Pubkey) {
         &[],
     )
     .expect("update_config (lower the difficulty for tests)");
+
+    // Motherlode singleton (fee-paying Mine requires it).
+    send(&mut svm, &[sdk::init_motherlode(admin.pubkey())], &admin, &[])
+        .expect("init_motherlode");
+
+    // The fee wallet must stay rent-exempt when the 5000-lamport fee lands
+    // (on mainnet it is the funded ops wallet).
+    svm.airdrop(&FEE_WALLET, 1_000_000_000).unwrap();
 
     (svm, admin, mint)
 }
@@ -144,6 +153,10 @@ fn get_referral(svm: &LiteSVM, authority: &Pubkey) -> Referral {
     get_state(svm, &pda::referral_pda(authority).0)
 }
 
+fn get_motherlode(svm: &LiteSVM) -> Motherlode {
+    get_state(svm, &pda::motherlode_pda().0)
+}
+
 fn token_balance(svm: &LiteSVM, mint: &Pubkey, owner: &Pubkey) -> u64 {
     let acc = svm.get_account(&pda::ata(owner, mint)).unwrap();
     u64::from_le_bytes(acc.data[64..72].try_into().unwrap())
@@ -217,12 +230,14 @@ fn warp_to(svm: &mut LiteSVM, ts: i64) {
     svm.expire_blockhash();
 }
 
-/// Rolls the round over with the crank at the current clock.
+/// Rolls the round over with the crank at the current clock. The crank
+/// takes the current Motherlode candidates' Win PDAs, exactly like the bot.
 fn crank_next(svm: &mut LiteSVM, payer: &Keypair) {
     let config = get_config(svm);
+    let candidates = get_motherlode(svm).candidates.map(Pubkey::new_from_array);
     send(
         svm,
-        &[sdk::crank(payer.pubkey(), config.current_round + 1)],
+        &[sdk::crank(payer.pubkey(), config.current_round + 1, candidates)],
         payer,
         &[],
     )
@@ -237,14 +252,34 @@ fn advance_round(svm: &mut LiteSVM, payer: &Keypair) {
     svm.set_sysvar(&clock);
     // Refresh the blockhash so transactions are not deduplicated.
     svm.expire_blockhash();
+    crank_next(svm, payer);
+}
+
+/// Grinds a SlotHashes entropy such that the NEXT crank's Motherlode draw
+/// hits (or misses) deterministically, reproducing the on-chain roll
+/// host-side. Randomness in the program comes from this sysvar, so the
+/// test fully controls the outcome even at mainnet odds.
+fn rig_draw(svm: &mut LiteSVM, hit: bool) {
     let config = get_config(svm);
-    send(
-        svm,
-        &[sdk::crank(payer.pubkey(), config.current_round + 1)],
-        payer,
-        &[],
-    )
-    .expect("crank");
+    let ml = get_motherlode(svm);
+    let slot: u64 = 1;
+    loop {
+        let hash = Hash::new_unique();
+        // slot_hashes_entropy = vec len skipped, then slot u64 + hash.
+        let mut entropy = [0u8; 40];
+        entropy[..8].copy_from_slice(&slot.to_le_bytes());
+        entropy[8..].copy_from_slice(hash.as_ref());
+        let draw = solana_sdk::keccak::hashv(&[
+            entropy.as_slice(),
+            &config.current_round.to_le_bytes(),
+            &ml.hashes.to_le_bytes(),
+        ]);
+        let roll = u64::from_le_bytes(draw.as_ref()[..8].try_into().unwrap());
+        if (roll % MOTHERLODE_ODDS == 0) == hit {
+            svm.set_sysvar::<SlotHashes>(&SlotHashes::new(&[(slot, hash)]));
+            return;
+        }
+    }
 }
 
 // ---------- tests ----------
@@ -529,7 +564,7 @@ fn test_round_seconds_change_applies_to_next_round() {
 
     // The crank opens round 1 with the new, smaller budget.
     advance_round(&mut svm, &admin);
-    assert_eq!(get_round(&svm, 1).budget, round_budget(15));
+    assert_eq!(get_round(&svm, 1).budget, miners_budget(round_budget(15)));
 
     // Round 0 settles with its frozen budget (60 s), not the new one.
     mine(&mut svm, &miner_kp, &mint).expect("mine r1");
@@ -1597,4 +1632,246 @@ fn test_unlock_rejects_non_canonical_vault() {
     // A second unlock has nothing to work on and fails cleanly.
     send(&mut svm, &[sdk::unlock(alice.pubkey(), mint)], &alice, &[])
         .expect_err("double unlock must fail");
+}
+
+// ---------- Motherlode ----------
+
+fn get_win(svm: &LiteSVM, authority: &Pubkey) -> Win {
+    get_state(svm, &pda::win_pda(authority).0)
+}
+
+/// SPL mint supply (to verify claim mints exactly the payout net of burn).
+fn mint_supply(svm: &LiteSVM, mint: &Pubkey) -> u64 {
+    let acc = svm.get_account(mint).unwrap();
+    u64::from_le_bytes(acc.data[36..44].try_into().unwrap())
+}
+
+#[test]
+fn test_motherlode_fee_and_hash_count() {
+    let (mut svm, admin, mint) = setup();
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    register_miner(&mut svm, &alice);
+    register_miner(&mut svm, &bob);
+
+    let fee_wallet_before = svm.get_balance(&FEE_WALLET).unwrap_or(0);
+
+    // Every mine instruction pays the fee and counts as one chance at the
+    // strike; the first hash always fills every candidate slot.
+    mine(&mut svm, &alice, &mint).expect("alice mines");
+    let ml = get_motherlode(&svm);
+    assert_eq!(ml.hashes, 1);
+    assert_eq!(ml.round_index, get_config(&svm).current_round);
+    assert_eq!(ml.candidates, [alice.pubkey().to_bytes(); MOTHERLODE_WINNERS]);
+    assert_eq!(ml.total_fees, MINE_FEE_LAMPORTS);
+    assert_eq!(
+        svm.get_balance(&FEE_WALLET).unwrap(),
+        fee_wallet_before + MINE_FEE_LAMPORTS
+    );
+
+    mine(&mut svm, &bob, &mint).expect("bob mines");
+    let ml = get_motherlode(&svm);
+    assert_eq!(ml.hashes, 2);
+    assert_eq!(ml.total_fees, 2 * MINE_FEE_LAMPORTS);
+    assert_eq!(
+        svm.get_balance(&FEE_WALLET).unwrap(),
+        fee_wallet_before + 2 * MINE_FEE_LAMPORTS
+    );
+
+    // A new round resets the hash counter; the lifetime fee counter and
+    // the pot never reset.
+    rig_draw(&mut svm, false);
+    advance_round(&mut svm, &admin);
+    mine(&mut svm, &alice, &mint).expect("alice mines round 1");
+    let ml = get_motherlode(&svm);
+    assert_eq!(ml.hashes, 1);
+    assert_eq!(ml.round_index, get_config(&svm).current_round);
+    assert_eq!(ml.total_fees, 3 * MINE_FEE_LAMPORTS);
+}
+
+#[test]
+fn test_motherlode_pot_draw_claim_burn() {
+    let (mut svm, admin, mint) = setup();
+    let alice = Keypair::new();
+    register_miner(&mut svm, &alice);
+    set_balance(&mut svm, &mint, &alice.pubkey(), 0);
+    let tithe = motherlode_tithe(DEFAULT_BUDGET);
+
+    // Round 0: mined, rigged miss -> the pot accrues, nobody wins.
+    mine(&mut svm, &alice, &mint).expect("mine round 0");
+    rig_draw(&mut svm, false);
+    advance_round(&mut svm, &admin);
+    let ml = get_motherlode(&svm);
+    assert_eq!(ml.pot, tithe);
+    assert!(svm.get_account(&pda::win_pda(&alice.pubkey()).0).is_none());
+
+    // An empty round adds nothing to the pot (its emission lapses whole).
+    rig_draw(&mut svm, false);
+    advance_round(&mut svm, &admin);
+    assert_eq!(get_motherlode(&svm).pot, tithe);
+
+    // Round 2: mined, rigged hit -> the whole pot (two mined tithes) lands
+    // in alice's Win account and the pot restarts.
+    mine(&mut svm, &alice, &mint).expect("mine round 2");
+    rig_draw(&mut svm, true);
+    let round_seconds = get_config(&svm).round_seconds as i64;
+    let mut clock: Clock = svm.get_sysvar();
+    clock.unix_timestamp += round_seconds + 1;
+    svm.set_sysvar(&clock);
+    svm.expire_blockhash();
+
+    // A crank pointing the win slots at the wrong wallets fails on a hit;
+    // the retry with the real candidates goes through (the bot re-reads).
+    let config = get_config(&svm);
+    let err = send(
+        &mut svm,
+        &[sdk::crank(
+            admin.pubkey(),
+            config.current_round + 1,
+            [Pubkey::new_unique(); MOTHERLODE_WINNERS],
+        )],
+        &admin,
+        &[],
+    )
+    .expect_err("a crank with stale candidates must fail on a hit");
+    assert!(err.contains("Custom(1)"), "expected InvalidAccount: {err}");
+    crank_next(&mut svm, &admin);
+
+    // Alice was the only miner, so she holds every candidate slot and the
+    // whole pot (all three shares plus the division dust) lands in her
+    // single Win account.
+    let ml = get_motherlode(&svm);
+    assert_eq!(ml.pot, 0);
+    assert_eq!(ml.last_winners, [alice.pubkey().to_bytes(); MOTHERLODE_WINNERS]);
+    assert_eq!(ml.last_win_amount, 2 * tithe / MOTHERLODE_WINNERS as u64);
+    let win = get_win(&svm, &alice.pubkey());
+    assert_eq!(win.authority, alice.pubkey().to_bytes());
+    assert_eq!(win.amount, 2 * tithe);
+
+    // Claim: 80% mints to the winner, 20% mints to the treasury ATA and
+    // burns in the same instruction, the Win account closes.
+    let (treasury, _) = pda::treasury_pda();
+    svm.set_account(
+        pda::ata(&treasury, &mint),
+        token_account(&mint, &treasury, 0),
+    )
+    .unwrap();
+    let supply_before = mint_supply(&svm, &mint);
+    let expected_burn = 2 * tithe * MOTHERLODE_BURN_BPS / BPS_DENOM;
+    send(
+        &mut svm,
+        &[sdk::claim_motherlode(alice.pubkey(), mint)],
+        &alice,
+        &[],
+    )
+    .expect("claim motherlode");
+    assert_eq!(
+        token_balance(&svm, &mint, &alice.pubkey()),
+        2 * tithe - expected_burn
+    );
+    // Net supply grows only by the payout: the burned slice minted and
+    // burned within the instruction.
+    assert_eq!(
+        mint_supply(&svm, &mint),
+        supply_before + 2 * tithe - expected_burn
+    );
+    assert_eq!(token_balance(&svm, &mint, &treasury), 0);
+    assert_eq!(get_motherlode(&svm).total_burned, expected_burn);
+    assert!(account_closed(&svm, &pda::win_pda(&alice.pubkey()).0));
+
+    // Nothing left to claim.
+    send(
+        &mut svm,
+        &[sdk::claim_motherlode(alice.pubkey(), mint)],
+        &alice,
+        &[],
+    )
+    .expect_err("double claim must fail");
+}
+
+/// A strike with several miners in the round splits the pot across the
+/// candidate slots: each candidate's Win account ends up with one share
+/// per slot it holds (the division dust goes with slot 0), and the shares
+/// always add back up to the whole pot.
+#[test]
+fn test_motherlode_split_across_candidates() {
+    let (mut svm, admin, mint) = setup();
+    let miners: Vec<Keypair> = (0..5).map(|_| Keypair::new()).collect();
+    for m in &miners {
+        register_miner(&mut svm, m);
+    }
+    for m in &miners {
+        mine(&mut svm, m, &mint).expect("mine round 0");
+    }
+    let tithe = motherlode_tithe(DEFAULT_BUDGET);
+    assert_eq!(get_motherlode(&svm).hashes, miners.len() as u64);
+
+    rig_draw(&mut svm, true);
+    advance_round(&mut svm, &admin);
+
+    let ml = get_motherlode(&svm);
+    assert_eq!(ml.pot, 0);
+    let share = tithe / MOTHERLODE_WINNERS as u64;
+    let remainder = tithe - share * MOTHERLODE_WINNERS as u64;
+    assert_eq!(ml.last_win_amount, share);
+
+    // Expected payout per wallet: one share per slot held, dust with slot 0.
+    let mut expected = std::collections::HashMap::<[u8; 32], u64>::new();
+    for (slot, cand) in ml.last_winners.iter().enumerate() {
+        // Every winner really is one of the round's miners.
+        assert!(miners.iter().any(|m| m.pubkey().to_bytes() == *cand));
+        *expected.entry(*cand).or_default() +=
+            share + if slot == 0 { remainder } else { 0 };
+    }
+    assert_eq!(expected.values().sum::<u64>(), tithe);
+    for (cand, amount) in expected {
+        let win = get_win(&svm, &Pubkey::new_from_array(cand));
+        assert_eq!(win.authority, cand);
+        assert_eq!(win.amount, amount);
+    }
+}
+
+#[test]
+fn test_motherlode_win_accumulates_and_draws_continue() {
+    let (mut svm, admin, mint) = setup();
+    let alice = Keypair::new();
+    register_miner(&mut svm, &alice);
+    set_balance(&mut svm, &mint, &alice.pubkey(), 0);
+    let tithe = motherlode_tithe(DEFAULT_BUDGET);
+
+    // First strike.
+    mine(&mut svm, &alice, &mint).expect("mine round 0");
+    rig_draw(&mut svm, true);
+    advance_round(&mut svm, &admin);
+    let win = get_win(&svm, &alice.pubkey());
+    assert_eq!(win.amount, tithe);
+    let first_since = win.since_ts;
+
+    // Second strike before the first was claimed: the draw is not paused,
+    // the amounts add up, the original timestamp stays.
+    mine(&mut svm, &alice, &mint).expect("mine round 1");
+    rig_draw(&mut svm, true);
+    advance_round(&mut svm, &admin);
+    let win = get_win(&svm, &alice.pubkey());
+    assert_eq!(win.amount, 2 * tithe);
+    assert_eq!(win.since_ts, first_since);
+    assert_eq!(get_motherlode(&svm).pot, 0);
+
+    // Someone else claiming alice's win fails.
+    let bob = Keypair::new();
+    svm.airdrop(&bob.pubkey(), 1_000_000_000).unwrap();
+    let (treasury, _) = pda::treasury_pda();
+    svm.set_account(
+        pda::ata(&treasury, &mint),
+        token_account(&mint, &treasury, 0),
+    )
+    .unwrap();
+    let mut ix = sdk::claim_motherlode(bob.pubkey(), mint);
+    // Point bob's claim at alice's win account.
+    ix.accounts[1] = solana_sdk::instruction::AccountMeta::new(
+        pda::win_pda(&alice.pubkey()).0,
+        false,
+    );
+    let err = send(&mut svm, &[ix], &bob, &[]).expect_err("foreign claim must fail");
+    assert!(err.contains("Custom(3)"), "expected Unauthorized: {err}");
 }

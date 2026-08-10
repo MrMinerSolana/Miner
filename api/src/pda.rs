@@ -34,6 +34,14 @@ pub fn lock_pda(authority: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[LOCK_SEED, authority.as_ref()], &crate::id())
 }
 
+pub fn motherlode_pda() -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[MOTHERLODE_SEED], &crate::id())
+}
+
+pub fn win_pda(authority: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[WIN_SEED, authority.as_ref()], &crate::id())
+}
+
 /// Per-user lock vault: the canonical ATA of the lock PDA.
 pub fn lock_vault(authority: &Pubkey, mint: &Pubkey) -> Pubkey {
     ata(&lock_pda(authority).0, mint)

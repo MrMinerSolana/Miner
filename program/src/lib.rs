@@ -1,7 +1,9 @@
 mod authorize_session;
 mod claim;
+mod claim_motherlode;
 mod close_round;
 mod crank;
+mod init_motherlode;
 mod initialize;
 mod loaders;
 mod lock;
@@ -49,5 +51,7 @@ pub fn process_instruction(
         MinerInstruction::SetRefName => set_refname::process(accounts, rest),
         MinerInstruction::Lock => lock::process(accounts, rest),
         MinerInstruction::Unlock => unlock::process(accounts),
+        MinerInstruction::InitMotherlode => init_motherlode::process(accounts),
+        MinerInstruction::ClaimMotherlode => claim_motherlode::process(accounts),
     }
 }

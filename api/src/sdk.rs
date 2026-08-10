@@ -69,13 +69,17 @@ pub fn mine(
     Instruction {
         program_id: crate::id(),
         accounts: vec![
-            AccountMeta::new_readonly(signer, true),
+            // Writable: the signer pays MINE_FEE_LAMPORTS to the fee wallet.
+            AccountMeta::new(signer, true),
             AccountMeta::new(miner, false),
             AccountMeta::new_readonly(config, false),
             AccountMeta::new(current_round, false),
             AccountMeta::new_readonly(prev_round, false),
             AccountMeta::new_readonly(token_account, false),
             AccountMeta::new_readonly(SLOT_HASHES_SYSVAR_ID, false),
+            AccountMeta::new(FEE_WALLET, false),
+            AccountMeta::new(pda::motherlode_pda().0, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
         ],
         data,
     }
@@ -245,18 +249,72 @@ pub fn set_refname(authority: Pubkey, name: &str) -> Instruction {
     }
 }
 
-pub fn crank(payer: Pubkey, new_round_index: u64) -> Instruction {
+/// Crank: `candidates` are the current Motherlode candidate slots (read
+/// from the Motherlode account before building, in slot order;
+/// Pubkey::default() when there are no hashes). On a strike hit the
+/// program splits the pot into the candidates' Win PDAs, so stale
+/// candidates make the transaction fail; just re-read and retry.
+pub fn crank(
+    payer: Pubkey,
+    new_round_index: u64,
+    candidates: [Pubkey; MOTHERLODE_WINNERS],
+) -> Instruction {
     let (config, _) = pda::config_pda();
     let (new_round, _) = pda::round_pda(new_round_index);
+    let (closing_round, _) = pda::round_pda(new_round_index - 1);
+    let mut accounts = vec![
+        AccountMeta::new(payer, true),
+        AccountMeta::new(config, false),
+        AccountMeta::new(new_round, false),
+        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+        AccountMeta::new_readonly(closing_round, false),
+        AccountMeta::new(pda::motherlode_pda().0, false),
+        AccountMeta::new_readonly(SLOT_HASHES_SYSVAR_ID, false),
+    ];
+    for candidate in candidates {
+        accounts.push(AccountMeta::new(pda::win_pda(&candidate).0, false));
+    }
+    Instruction {
+        program_id: crate::id(),
+        accounts,
+        data: vec![MinerInstruction::Crank as u8],
+    }
+}
+
+/// Create the Motherlode singleton (permissionless, once).
+pub fn init_motherlode(payer: Pubkey) -> Instruction {
     Instruction {
         program_id: crate::id(),
         accounts: vec![
             AccountMeta::new(payer, true),
-            AccountMeta::new(config, false),
-            AccountMeta::new(new_round, false),
+            AccountMeta::new(pda::motherlode_pda().0, false),
             AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
         ],
-        data: vec![MinerInstruction::Crank as u8],
+        data: vec![MinerInstruction::InitMotherlode as u8],
+    }
+}
+
+/// Claim a Motherlode win: 80% mints to the winner, 20% mints to the
+/// treasury ATA and burns in the same instruction. Both ATAs must exist;
+/// clients prepend idempotent create-ATA instructions.
+pub fn claim_motherlode(authority: Pubkey, mint: Pubkey) -> Instruction {
+    let (win, _) = pda::win_pda(&authority);
+    let (config, _) = pda::config_pda();
+    let (treasury, _) = pda::treasury_pda();
+    Instruction {
+        program_id: crate::id(),
+        accounts: vec![
+            AccountMeta::new(authority, true),
+            AccountMeta::new(win, false),
+            AccountMeta::new(pda::motherlode_pda().0, false),
+            AccountMeta::new_readonly(config, false),
+            AccountMeta::new(mint, false),
+            AccountMeta::new_readonly(treasury, false),
+            AccountMeta::new(pda::ata(&authority, &mint), false),
+            AccountMeta::new(pda::ata(&treasury, &mint), false),
+            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+        ],
+        data: vec![MinerInstruction::ClaimMotherlode as u8],
     }
 }
 

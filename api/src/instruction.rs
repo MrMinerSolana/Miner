@@ -20,10 +20,13 @@ pub enum MinerInstruction {
     AuthorizeSession = 2,
 
     /// Hash submission (once per round): PoW verification, weight accrual,
-    /// lazy settlement of the previous round.
-    /// Accounts: [signer (authority or session), miner, config,
-    ///           current_round, prev_round, token_account (authority ATA),
-    ///           slot_hashes]
+    /// lazy settlement of the previous round. Charges MINE_FEE_LAMPORTS
+    /// from the signer to the fee wallet and counts one Motherlode chance
+    /// (reservoir sampling updates the round's winner candidate).
+    /// Accounts: [signer (authority or session; writable, pays the fee),
+    ///           miner, config, current_round, prev_round,
+    ///           token_account (authority ATA), slot_hashes,
+    ///           fee_wallet (FEE_WALLET), motherlode (PDA), system_program]
     /// Trailing accounts (any order, told apart by discriminator): the
     /// Referral PDA (required once enrolled) and/or the Lock PDA (optional;
     /// without it the locked tokens simply do not count that submit).
@@ -40,7 +43,17 @@ pub enum MinerInstruction {
     Claim = 4,
 
     /// Close the current round and open the next (permissionless crank).
-    /// Accounts: [payer (signer), config, new_round (PDA), system_program]
+    /// Carves MOTHERLODE_BPS of the closing round's budget into the pot
+    /// (only when the round had any weight) and runs the Motherlode strike roll:
+    /// with 1/MOTHERLODE_ODDS probability the pot splits evenly across the
+    /// MOTHERLODE_WINNERS candidate slots into their Win accounts (created
+    /// here if needed, rent from payer; a wallet holding several slots gets
+    /// several shares in one account).
+    /// The win accounts passed must match the current candidates in slot
+    /// order; when the roll misses they are left untouched.
+    /// Accounts: [payer (signer), config, new_round (PDA), system_program,
+    ///           closing_round (the current round), motherlode (PDA),
+    ///           slot_hashes, win_0..win_2 (candidates' PDAs, slot order)]
     Crank = 5,
 
     /// Close an expired Round account after retention (rent to the caller).
@@ -93,6 +106,20 @@ pub enum MinerInstruction {
     ///           pinned to config.mint), user token account, config,
     ///           token_program]
     Unlock = 12,
+
+    /// Create the Motherlode singleton PDA (permissionless, once; payer
+    /// covers the rent). Required before fee-paying Mine can run.
+    /// Accounts: [payer (signer), motherlode (PDA), system_program]
+    InitMotherlode = 13,
+
+    /// Claim a Motherlode win: MOTHERLODE_BURN_BPS of the amount is minted
+    /// to the treasury ATA and burned in the same instruction (a real,
+    /// visible Burn), the rest mints to the winner. Closes the Win PDA
+    /// (rent to the winner). Must be signed by the authority itself.
+    /// Accounts: [authority (signer), win (PDA), motherlode (PDA), config,
+    ///           mint, treasury (PDA), token_account (authority ATA),
+    ///           treasury_token (treasury ATA), token_program]
+    ClaimMotherlode = 14,
 }
 
 impl MinerInstruction {
@@ -111,6 +138,8 @@ impl MinerInstruction {
             10 => Self::SetRefName,
             11 => Self::Lock,
             12 => Self::Unlock,
+            13 => Self::InitMotherlode,
+            14 => Self::ClaimMotherlode,
             _ => return None,
         })
     }

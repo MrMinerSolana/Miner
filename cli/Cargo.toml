@@ -1,11 +1,17 @@
 [package]
 name = "miner-cli"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 description = "CLI miner for the MINER protocol on Solana - mine, claim and inspect from your terminal (binary: miner)"
 license = "MIT"
 homepage = "https://miner.tools"
 documentation = "https://miner.tools"
+
+[features]
+# Devnet rehearsal: minute-scale lock tiers, `lock` takes seconds not days.
+short-lock = ["miner-api/short-lock"]
+# Devnet rehearsal: the Motherlode draw strikes on every round close.
+short-motherlode = ["miner-api/short-motherlode"]
 
 [[bin]]
 name = "miner"

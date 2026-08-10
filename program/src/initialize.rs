@@ -64,7 +64,8 @@ pub fn process(accounts: &[AccountInfo]) -> ProgramResult {
             index: 0,
             total_weight: 0,
             start_ts: now,
-            budget: round_budget(INITIAL_ROUND_SECONDS),
+            // The miners' 90% cut, like every cranked round (see crank.rs).
+            budget: miners_budget(round_budget(INITIAL_ROUND_SECONDS)),
         },
     )?;
 

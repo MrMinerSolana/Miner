@@ -181,10 +181,22 @@ pub const MINER_FLAG_REFERRAL: u64 = 1 << 8;
 /// Locked tokens physically cannot move between wallets, so they are
 /// exempt from the min-balance (anti-cycling) rule by construction, and
 /// they count from the very next submit.
+#[cfg(not(feature = "short-lock"))]
 pub const LOCK_TIERS: [(i64, u64); 3] = [
     (7 * 86_400, 12_000),  // 7 days  -> 1.2x
     (30 * 86_400, 15_000), // 30 days -> 1.5x
     (90 * 86_400, 20_000), // 90 days -> 2.0x
+];
+
+/// Devnet rehearsal (`--features short-lock`): the same code path with
+/// compressed tiers (minutes instead of days) so a full lock -> mine ->
+/// expire -> withdraw cycle can be watched live on a real cluster.
+/// Never part of a mainnet artifact.
+#[cfg(feature = "short-lock")]
+pub const LOCK_TIERS: [(i64, u64); 3] = [
+    (60, 12_000),  // 1 minute  -> 1.2x
+    (120, 15_000), // 2 minutes -> 1.5x
+    (180, 20_000), // 3 minutes -> 2.0x
 ];
 
 /// Multiplier for an exact tier duration (None = not a valid tier).
@@ -198,6 +210,64 @@ pub const fn lock_multiplier_bps(duration_secs: i64) -> Option<u64> {
     }
     None
 }
+
+/// Motherlode: the protocol strike reward. Every round carves
+/// MOTHERLODE_BPS of its budget into a pool (only rounds that actually had
+/// miners; empty rounds keep burning everything). Every mine instruction
+/// is one chance at the strike for that round; MOTHERLODE_WINNERS
+/// independent candidate slots are each kept with reservoir sampling
+/// (every hash ends up with an equal 1/n chance per slot, O(1) state).
+/// When the crank closes a round, the strike hits with 1/MOTHERLODE_ODDS
+/// probability: the pool splits evenly across the candidates' Win accounts
+/// (the same wallet may hold more than one slot and simply gets a bigger
+/// cut), claimable any time; the pool restarts and later strikes keep
+/// running. At claim MOTHERLODE_BURN_BPS of the win is minted to the
+/// treasury ATA and burned in the same instruction (a real, visible Burn),
+/// the rest goes to the winner.
+pub const MOTHERLODE_BPS: u64 = 1000; // 10% of every round budget
+pub const MOTHERLODE_BURN_BPS: u64 = 2000; // 20% of a win burns at claim
+
+/// How many candidate slots a strike pays out to (even split of the pool;
+/// the division remainder goes to the first slot as dust).
+pub const MOTHERLODE_WINNERS: usize = 3;
+
+/// Strike chance: 1 in N round closes. 1440 rounds = on average one
+/// strike every day at 60 s rounds.
+#[cfg(not(feature = "short-motherlode"))]
+pub const MOTHERLODE_ODDS: u64 = 1440;
+
+/// Devnet rehearsal (`--features short-motherlode`): every round close
+/// strikes, so the accrue -> win -> claim -> burn cycle can be watched
+/// live. Never part of a mainnet artifact.
+#[cfg(feature = "short-motherlode")]
+pub const MOTHERLODE_ODDS: u64 = 1;
+
+/// The miners' cut of a full round budget: what Round.budget stores. The
+/// Motherlode share is withheld at round open and credited to the pool
+/// when the round closes with any weight (empty rounds keep burning
+/// everything).
+pub const fn miners_budget(full_budget: u64) -> u64 {
+    ((full_budget as u128) * ((BPS_DENOM - MOTHERLODE_BPS) as u128) / (BPS_DENOM as u128))
+        as u64
+}
+
+/// The Motherlode share recovered from a stored (miners') budget at round
+/// close: the withheld remainder of the same full budget.
+pub const fn motherlode_tithe(stored_budget: u64) -> u64 {
+    ((stored_budget as u128) * (MOTHERLODE_BPS as u128)
+        / ((BPS_DENOM - MOTHERLODE_BPS) as u128)) as u64
+}
+
+/// Mining fee in lamports, charged per mine instruction and sent to the
+/// fee wallet (the crank/ops wallet). Levels the playing field between
+/// batched farms and individual miners (a batch pays per instruction) and
+/// funds the daily buyback-and-burn of $MINER.
+pub const MINE_FEE_LAMPORTS: u64 = 5000;
+
+/// Fee destination: the ops (crank) wallet. A daily job swaps the fees
+/// accumulated that day (tracked by Motherlode.total_fees) for $MINER and
+/// burns them.
+pub const FEE_WALLET: Pubkey = pubkey!("D9pvV1SQqYU8d2zcZHkhAdkzuZKaXntkKSNFLsvQvxxu");
 
 /// Custom referral name (vanity code) length bounds. Charset: a-z 0-9 _
 /// (lowercase only, clients normalize before sending). First come, first
@@ -213,6 +283,8 @@ pub const ROUND_SEED: &[u8] = b"round";
 pub const MINER_SEED: &[u8] = b"miner";
 pub const REFERRAL_SEED: &[u8] = b"referral";
 pub const LOCK_SEED: &[u8] = b"lock";
+pub const MOTHERLODE_SEED: &[u8] = b"motherlode";
+pub const WIN_SEED: &[u8] = b"win";
 /// name -> owner (uniqueness + resolution of ?ref=<name> links).
 pub const REFNAME_SEED: &[u8] = b"refname";
 /// owner -> name (reverse lookup for UI + enforces one name per miner).
@@ -231,6 +303,9 @@ pub const SPL_TOKEN_MINT_TO_IX: u8 = 7;
 
 /// Transfer instruction index in the SPL Token program.
 pub const SPL_TOKEN_TRANSFER_IX: u8 = 3;
+
+/// Burn instruction index in the SPL Token program.
+pub const SPL_TOKEN_BURN_IX: u8 = 8;
 
 /// CloseAccount instruction index in the SPL Token program.
 pub const SPL_TOKEN_CLOSE_ACCOUNT_IX: u8 = 9;
