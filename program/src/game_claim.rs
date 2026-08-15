@@ -31,6 +31,14 @@ pub fn process(accounts: &[AccountInfo]) -> ProgramResult {
         return Err(MinerError::Unauthorized.into());
     }
 
+    // Pin the round account to the entry's round PDA. When the account no
+    // longer exists the round was garbage-collected after the claim window
+    // (GameCloseRound): the stake lapsed, but the entry rent still goes
+    // back to the player.
+    expect_key(round_info, &pda::game_round_pda(entry.round).0)?;
+    if round_info.data_is_empty() {
+        return close_program_account(entry_info, authority_info);
+    }
     expect_program_account(round_info, GAME_ROUND_DISCRIMINATOR)?;
     let round = read_state::<GameRound>(round_info)?;
     if round.index != entry.round {

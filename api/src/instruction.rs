@@ -176,6 +176,18 @@ pub enum MinerInstruction {
     ///           game_vault (PDA), user token account, game token vault,
     ///           token_program]
     GameClaimWin = 19,
+
+    /// Close a settled game round account once the claim window
+    /// (GAME_ROUND_RETENTION_SECONDS from the round's start) has passed;
+    /// the rent goes to the recipient. Gated to the FEE_WALLET or the
+    /// config admin signature so only the operator can garbage-collect
+    /// rounds and collect the recycled rent. Unclaimed entries of a
+    /// closed round lapse: GameClaim then refunds only the entry rent.
+    /// GameWin (players' Motherlode) claims never expire - they do not
+    /// touch round accounts.
+    /// Accounts: [signer (FEE_WALLET or config.admin), recipient
+    ///           (writable), config, game, game_round (writable)]
+    GameCloseRound = 20,
 }
 
 impl MinerInstruction {
@@ -201,6 +213,7 @@ impl MinerInstruction {
             17 => Self::GameSettle,
             18 => Self::GameClaim,
             19 => Self::GameClaimWin,
+            20 => Self::GameCloseRound,
             _ => return None,
         })
     }

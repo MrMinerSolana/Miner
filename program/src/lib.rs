@@ -5,6 +5,7 @@ mod close_round;
 mod crank;
 mod game_claim;
 mod game_claim_win;
+mod game_close_round;
 mod game_enter;
 mod game_settle;
 mod init_game;
@@ -63,5 +64,6 @@ pub fn process_instruction(
         MinerInstruction::GameSettle => game_settle::process(accounts),
         MinerInstruction::GameClaim => game_claim::process(accounts),
         MinerInstruction::GameClaimWin => game_claim_win::process(accounts),
+        MinerInstruction::GameCloseRound => game_close_round::process(accounts),
     }
 }

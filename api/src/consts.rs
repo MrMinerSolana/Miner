@@ -329,6 +329,12 @@ pub const GAME_MIN_WEIGHT: u64 = 1_000_000;
 pub const GAME_EMA_ALPHA: u64 = 8;
 pub const GAME_EMA_CLAMP_BPS: u64 = 500;
 
+/// Claim window for settled game rounds: after this many seconds from the
+/// round's start the round account may be garbage-collected by
+/// GameCloseRound (fee-wallet gated; rent to the crank). An entry claimed
+/// after its round is gone refunds only the entry rent - the stake lapsed.
+pub const GAME_ROUND_RETENTION_SECONDS: i64 = 86_400;
+
 /// GameRound.settled states.
 pub const GAME_ROUND_OPEN: u64 = 0;
 pub const GAME_ROUND_SETTLED: u64 = 1;

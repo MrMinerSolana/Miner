@@ -1991,7 +1991,7 @@ dependencies = [
 
 [[package]]
 name = "miner-api"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bytemuck",
  "solana-program",
@@ -1999,7 +1999,7 @@ dependencies = [
 
 [[package]]
 name = "miner-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bytemuck",
  "miner-api",

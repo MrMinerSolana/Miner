@@ -2300,6 +2300,105 @@ fn game_lone_survivor_refunds_and_total_collapse_burns() {
 }
 
 #[test]
+fn game_close_round_gating_and_lapse() {
+    let (mut svm, admin, mint) = setup();
+    let pool = setup_game(&mut svm, &admin, &mint);
+
+    let a = Keypair::new();
+    let b = Keypair::new();
+    for p in [&a, &b] {
+        svm.airdrop(&p.pubkey(), 10_000_000_000).unwrap();
+    }
+    game_stake(&mut svm, &a, &mint, 0, 1_000_000_000, 0).expect("a enters");
+    game_stake(&mut svm, &b, &mint, 1, 1_000_000_000, 0).expect("b enters");
+    rig_game(&mut svm, Some(&[1, 4, 8]), false);
+    advance_game_round(&mut svm, &admin, &mint, &pool);
+
+    // Closing a settled round before the claim window ends fails.
+    let recipient = Keypair::new().pubkey();
+    let err = send(
+        &mut svm,
+        &[sdk::game_close_round(admin.pubkey(), recipient, 0)],
+        &admin,
+        &[],
+    )
+    .expect_err("close before retention must fail");
+    assert!(err.contains("Custom(7)"), "expected RoundNotExpired: {err}");
+
+    // Past the window now.
+    let round0 = get_game_round(&svm, 0);
+    let mut clock: Clock = svm.get_sysvar();
+    clock.unix_timestamp = round0.start_ts + GAME_ROUND_RETENTION_SECONDS + 1;
+    svm.set_sysvar(&clock);
+    svm.expire_blockhash();
+
+    // The open round cannot be closed even after the window.
+    let game = get_game(&svm);
+    let err = send(
+        &mut svm,
+        &[sdk::game_close_round(
+            admin.pubkey(),
+            recipient,
+            game.current_round,
+        )],
+        &admin,
+        &[],
+    )
+    .expect_err("closing the open round must fail");
+    assert!(err.contains("Custom(22)"), "expected GameNotSettled: {err}");
+
+    // A random wallet cannot close (and cannot pocket the rent).
+    let mallory = Keypair::new();
+    svm.airdrop(&mallory.pubkey(), 1_000_000_000).unwrap();
+    let err = send(
+        &mut svm,
+        &[sdk::game_close_round(mallory.pubkey(), mallory.pubkey(), 0)],
+        &mallory,
+        &[],
+    )
+    .expect_err("non-operator close must fail");
+    assert!(err.contains("Custom(3)"), "expected Unauthorized: {err}");
+
+    // The operator closes round 0: the rent lands on the recipient and
+    // the account is gone.
+    let round_key = pda::game_round_pda(0).0;
+    let rent = svm.get_account(&round_key).unwrap().lamports;
+    send(
+        &mut svm,
+        &[sdk::game_close_round(admin.pubkey(), recipient, 0)],
+        &admin,
+        &[],
+    )
+    .expect("close after retention");
+    assert_eq!(svm.get_account(&recipient).unwrap().lamports, rent);
+    assert!(svm
+        .get_account(&round_key)
+        .map(|acc| acc.data.is_empty())
+        .unwrap_or(true));
+
+    // Double close fails (the account no longer parses).
+    send(
+        &mut svm,
+        &[sdk::game_close_round(admin.pubkey(), recipient, 0)],
+        &admin,
+        &[],
+    )
+    .expect_err("double close must fail");
+
+    // a survived round 0 but missed the claim window: the stake lapsed,
+    // only the entry rent comes back and the entry closes.
+    let a_lamports = svm.get_account(&a.pubkey()).unwrap().lamports;
+    send(&mut svm, &[sdk::game_claim(a.pubkey(), mint, 0)], &a, &[])
+        .expect("claim after close returns the entry rent");
+    let a_gain = svm.get_account(&a.pubkey()).unwrap().lamports - a_lamports;
+    assert!(a_gain > 0 && a_gain < 5_000_000, "a gain {a_gain}");
+    assert!(svm
+        .get_account(&pda::game_entry_pda(0, &a.pubkey()).0)
+        .map(|acc| acc.data.is_empty())
+        .unwrap_or(true));
+}
+
+#[test]
 fn game_enter_guards() {
     let (mut svm, admin, mint) = setup();
     let pool = setup_game(&mut svm, &admin, &mint);

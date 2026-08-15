@@ -490,6 +490,22 @@ pub fn game_claim_win(authority: Pubkey, mint: Pubkey) -> Instruction {
     }
 }
 
+/// Close an expired game round (fee-wallet / admin gated; rent to the
+/// recipient).
+pub fn game_close_round(signer: Pubkey, recipient: Pubkey, round_index: u64) -> Instruction {
+    Instruction {
+        program_id: crate::id(),
+        accounts: vec![
+            AccountMeta::new_readonly(signer, true),
+            AccountMeta::new(recipient, false),
+            AccountMeta::new_readonly(pda::config_pda().0, false),
+            AccountMeta::new_readonly(pda::game_pda().0, false),
+            AccountMeta::new(pda::game_round_pda(round_index).0, false),
+        ],
+        data: vec![MinerInstruction::GameCloseRound as u8],
+    }
+}
+
 /// Client-side hash verification (identical logic to the on-chain program).
 pub fn hash_meets_difficulty(
     challenge: &[u8; 32],
