@@ -15,6 +15,12 @@ short-halving = ["miner-api/short-halving"]
 short-lock = ["miner-api/short-lock"]
 # Forwarded to miner-api: devnet rehearsal with a draw on every round close.
 short-motherlode = ["miner-api/short-motherlode"]
+# Forwarded to miner-api: devnet rehearsal with 1-minute game rounds and
+# frequent players' Motherlode strikes.
+short-game = ["miner-api/short-game"]
+# Devnet rehearsal: skip the pool read, the price EMA keeps its init value
+# (no cp-amm pool exists on devnet). NEVER enable for a mainnet artifact.
+game-fixed-price = []
 
 [dependencies]
 miner-api = { workspace = true }

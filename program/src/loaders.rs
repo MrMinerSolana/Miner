@@ -302,6 +302,75 @@ pub fn settle_previous_round(
     Ok(())
 }
 
+/// Pays out from the game vaults: `sol` lamports from the SOL vault (a
+/// program-owned account, debited directly) to the recipient, and `miner`
+/// via an SPL transfer from the game token vault signed by the game PDA.
+/// Callers validate the accounts; this only moves the funds.
+pub fn game_payout<'info>(
+    game_info: &AccountInfo<'info>,
+    game_bump: u8,
+    vault_info: &AccountInfo<'info>,
+    game_token_info: &AccountInfo<'info>,
+    user_token_info: &AccountInfo<'info>,
+    recipient_info: &AccountInfo<'info>,
+    sol: u64,
+    miner: u64,
+) -> ProgramResult {
+    if sol > 0 {
+        **vault_info.try_borrow_mut_lamports()? = vault_info
+            .lamports()
+            .checked_sub(sol)
+            .ok_or(MinerError::Overflow)?;
+        **recipient_info.try_borrow_mut_lamports()? = recipient_info
+            .lamports()
+            .checked_add(sol)
+            .ok_or(MinerError::Overflow)?;
+    }
+    if miner > 0 {
+        let mut ix_data = Vec::with_capacity(9);
+        ix_data.push(SPL_TOKEN_TRANSFER_IX);
+        ix_data.extend_from_slice(&miner.to_le_bytes());
+        let ix = Instruction {
+            program_id: SPL_TOKEN_PROGRAM_ID,
+            accounts: vec![
+                AccountMeta::new(*game_token_info.key, false),
+                AccountMeta::new(*user_token_info.key, false),
+                AccountMeta::new_readonly(*game_info.key, true),
+            ],
+            data: ix_data,
+        };
+        invoke_signed(
+            &ix,
+            &[
+                game_token_info.clone(),
+                user_token_info.clone(),
+                game_info.clone(),
+            ],
+            &[&[GAME_SEED, &[game_bump]]],
+        )?;
+    }
+    Ok(())
+}
+
+/// Closes a program account: zeroes the data (no revival within the same
+/// transaction) and moves the rent to the recipient.
+pub fn close_program_account<'info>(
+    target: &AccountInfo<'info>,
+    recipient: &AccountInfo<'info>,
+) -> ProgramResult {
+    {
+        let mut data = target.try_borrow_mut_data()?;
+        data.fill(0);
+    }
+    let lamports = target.lamports();
+    **target.try_borrow_mut_lamports()? = 0;
+    **recipient.try_borrow_mut_lamports()? = recipient
+        .lamports()
+        .checked_add(lamports)
+        .ok_or(MinerError::Overflow)?;
+    Ok(())
+}
+
 /// Next challenge: keccak(old challenge, slot entropy, authority).
 pub fn next_challenge(
     old: &[u8; 32],

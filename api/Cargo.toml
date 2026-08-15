@@ -1,6 +1,6 @@
 [package]
 name = "miner-api"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Instructions, state and SDK for the MINER protocol - a proof-of-work mined SPL token where holdings boost mining power"
 license = "MIT"
@@ -20,6 +20,10 @@ short-lock = []
 # so the accrue -> win -> claim -> burn cycle can be observed live. NEVER
 # enable for a mainnet artifact.
 short-motherlode = []
+# Devnet rehearsal build: 1-minute game rounds and 1-in-3 players'
+# Motherlode strike odds, so full game cycles can be observed live. NEVER
+# enable for a mainnet artifact.
+short-game = []
 
 [dependencies]
 solana-program = { workspace = true }

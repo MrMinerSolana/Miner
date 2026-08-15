@@ -1875,3 +1875,631 @@ fn test_motherlode_win_accumulates_and_draws_continue() {
     let err = send(&mut svm, &[ix], &bob, &[]).expect_err("foreign claim must fail");
     assert!(err.contains("Custom(3)"), "expected Unauthorized: {err}");
 }
+
+// ---------- Tunnels (game) ----------
+
+/// The EMA the game tests initialize with: 0.0005 SOL per token.
+const GAME_EMA: u64 = 500_000;
+
+/// Raw cp-amm pool bytes: mint/WSOL mints at their offsets and the Q64.64
+/// sqrt price for the given spot (lamports per whole token).
+fn pool_account(mint: &Pubkey, spot_lamports_per_token: u64) -> Account {
+    let mut data = vec![0u8; CP_AMM_SQRT_PRICE_OFFSET + 16];
+    data[CP_AMM_TOKEN_A_OFFSET..CP_AMM_TOKEN_A_OFFSET + 32].copy_from_slice(mint.as_ref());
+    data[CP_AMM_TOKEN_B_OFFSET..CP_AMM_TOKEN_B_OFFSET + 32]
+        .copy_from_slice(WSOL_MINT.as_ref());
+    let sp = ((spot_lamports_per_token as f64 / 1e9).sqrt() * 18446744073709551616.0) as u128;
+    data[CP_AMM_SQRT_PRICE_OFFSET..CP_AMM_SQRT_PRICE_OFFSET + 16]
+        .copy_from_slice(&sp.to_le_bytes());
+    Account {
+        lamports: 1_000_000,
+        data,
+        owner: Pubkey::new_unique(),
+        executable: false,
+        rent_epoch: 0,
+    }
+}
+
+/// The integer spot the program reads back from pool_account's bytes
+/// (replicates the on-chain Q64.64 math; the float sqrt rounds a little).
+fn expected_spot(pool: &Account) -> u64 {
+    let sp = u128::from_le_bytes(
+        pool.data[CP_AMM_SQRT_PRICE_OFFSET..CP_AMM_SQRT_PRICE_OFFSET + 16]
+            .try_into()
+            .unwrap(),
+    );
+    let s = sp >> 32;
+    ((s * s).checked_mul(1_000_000_000).unwrap() >> 64) as u64
+}
+
+/// Creates the fake pool, the game token vault and the game state.
+fn setup_game(svm: &mut LiteSVM, admin: &Keypair, mint: &Pubkey) -> Pubkey {
+    let pool = Pubkey::new_unique();
+    svm.set_account(pool, pool_account(mint, GAME_EMA)).unwrap();
+    // The mint needs real supply on the books: the game burns from its
+    // vault, and SPL burn decrements the supply counter.
+    let (treasury, _) = pda::treasury_pda();
+    svm.set_account(*mint, mint_account(&treasury, 1_000_000 * ONE_TOKEN))
+        .unwrap();
+    // The game token vault (the game PDA's ATA), created client-side.
+    let (game_key, _) = pda::game_pda();
+    svm.set_account(
+        pda::game_token_vault(mint),
+        token_account(mint, &game_key, 0),
+    )
+    .unwrap();
+    send(
+        svm,
+        &[sdk::init_game(admin.pubkey(), pool, GAME_EMA)],
+        admin,
+        &[],
+    )
+    .expect("init_game");
+    pool
+}
+
+fn get_game(svm: &LiteSVM) -> Game {
+    get_state(svm, &pda::game_pda().0)
+}
+
+fn get_game_round(svm: &LiteSVM, index: u64) -> GameRound {
+    get_state(svm, &pda::game_round_pda(index).0)
+}
+
+fn get_game_win(svm: &LiteSVM, authority: &Pubkey) -> GameWin {
+    get_state(svm, &pda::game_win_pda(authority).0)
+}
+
+/// Stakes on a tunnel in the current game round.
+fn game_stake(
+    svm: &mut LiteSVM,
+    player: &Keypair,
+    mint: &Pubkey,
+    tunnel: u8,
+    sol: u64,
+    miner: u64,
+) -> Result<(), String> {
+    let game = get_game(svm);
+    send(
+        svm,
+        &[sdk::game_enter(
+            player.pubkey(),
+            *mint,
+            game.current_round,
+            tunnel,
+            sol,
+            miner,
+        )],
+        player,
+        &[],
+    )
+}
+
+/// Grinds a SlotHashes entropy so the next settle collapses exactly the
+/// target tunnel set (when given) AND the players' Motherlode roll hits
+/// or misses as requested, reproducing both on-chain rolls host-side
+/// (uniform draw without replacement among ALL of the tunnels).
+fn rig_game(svm: &mut LiteSVM, target: Option<&[usize]>, strike: bool) {
+    let game = get_game(svm);
+    let round = get_game_round(svm, game.current_round);
+    let slot: u64 = 1;
+    loop {
+        let hash = Hash::new_unique();
+        let mut entropy = [0u8; 40];
+        entropy[..8].copy_from_slice(&slot.to_le_bytes());
+        entropy[8..].copy_from_slice(hash.as_ref());
+
+        let collapse_ok = match target {
+            None => true,
+            Some(t) => {
+                let mut avail: Vec<usize> = (0..GAME_TUNNELS).collect();
+                let mut dead = Vec::new();
+                for pick in 0..GAME_COLLAPSES {
+                    let roll_hash = solana_sdk::keccak::hashv(&[
+                        entropy.as_slice(),
+                        &round.index.to_le_bytes(),
+                        &(pick as u64).to_le_bytes(),
+                    ]);
+                    let roll =
+                        u64::from_le_bytes(roll_hash.as_ref()[..8].try_into().unwrap());
+                    dead.push(avail.remove(roll as usize % avail.len()));
+                }
+                dead.len() == t.len() && t.iter().all(|x| dead.contains(x))
+            }
+        };
+
+        let strike_hash = solana_sdk::keccak::hashv(&[
+            entropy.as_slice(),
+            &round.index.to_le_bytes(),
+            &round.entries.to_le_bytes(),
+            b"game_motherlode",
+        ]);
+        let strike_roll =
+            u64::from_le_bytes(strike_hash.as_ref()[..8].try_into().unwrap());
+        let strike_ok = (strike_roll % GAME_MOTHERLODE_ODDS == 0) == strike;
+
+        if collapse_ok && strike_ok {
+            svm.set_sysvar::<SlotHashes>(&SlotHashes::new(&[(slot, hash)]));
+            return;
+        }
+    }
+}
+
+/// Settles the current game round at the current clock, exactly like the
+/// bot: candidates read from the closing round.
+fn game_settle_now(svm: &mut LiteSVM, payer: &Keypair, mint: &Pubkey, pool: &Pubkey) {
+    let game = get_game(svm);
+    let round = get_game_round(svm, game.current_round);
+    let candidates = round.candidates.map(Pubkey::new_from_array);
+    send(
+        svm,
+        &[sdk::game_settle(
+            payer.pubkey(),
+            *mint,
+            *pool,
+            game.current_round + 1,
+            candidates,
+        )],
+        payer,
+        &[],
+    )
+    .expect("game_settle");
+}
+
+/// Advances the clock past the game round deadline, settles, and skips
+/// the between-rounds intermission so the next round accepts entries.
+fn advance_game_round(svm: &mut LiteSVM, payer: &Keypair, mint: &Pubkey, pool: &Pubkey) {
+    let game = get_game(svm);
+    let mut clock: Clock = svm.get_sysvar();
+    clock.unix_timestamp = game.round_start_ts + game.round_seconds as i64 + 1;
+    svm.set_sysvar(&clock);
+    svm.expire_blockhash();
+    game_settle_now(svm, payer, mint, pool);
+    let game = get_game(svm);
+    let mut clock: Clock = svm.get_sysvar();
+    if clock.unix_timestamp < game.round_start_ts {
+        clock.unix_timestamp = game.round_start_ts + 1;
+        svm.set_sysvar(&clock);
+        svm.expire_blockhash();
+    }
+}
+
+#[test]
+fn game_init_admin_gate() {
+    let (mut svm, admin, mint) = setup();
+    let pool = Pubkey::new_unique();
+    svm.set_account(pool, pool_account(&mint, GAME_EMA)).unwrap();
+
+    // Non-admin init fails.
+    let mallory = Keypair::new();
+    svm.airdrop(&mallory.pubkey(), 10_000_000_000).unwrap();
+    let err = send(
+        &mut svm,
+        &[sdk::init_game(mallory.pubkey(), pool, GAME_EMA)],
+        &mallory,
+        &[],
+    )
+    .expect_err("non-admin init_game must fail");
+    assert!(err.contains("Custom(3)"), "expected Unauthorized: {err}");
+
+    // Admin init succeeds, re-init fails.
+    setup_game(&mut svm, &admin, &mint);
+    let game = get_game(&svm);
+    assert_eq!(game.ema_lamports_per_token, GAME_EMA);
+    assert_eq!(game.round_seconds, GAME_ROUND_SECONDS);
+    assert_eq!(game.current_round, 0);
+    send(
+        &mut svm,
+        &[sdk::init_game(admin.pubkey(), pool, GAME_EMA)],
+        &admin,
+        &[],
+    )
+    .expect_err("re-init must fail");
+}
+
+#[test]
+fn game_full_round_miner_tunnel_collapses() {
+    let (mut svm, admin, mint) = setup();
+    let pool = setup_game(&mut svm, &admin, &mint);
+
+    let a = Keypair::new();
+    let b = Keypair::new();
+    let c = Keypair::new();
+    for p in [&a, &b, &c] {
+        svm.airdrop(&p.pubkey(), 10_000_000_000).unwrap();
+    }
+    // c stakes 2000 MINER; at the 500_000 EMA that is exactly 1 SOL of
+    // weight, matching a and b.
+    set_balance(&mut svm, &mint, &c.pubkey(), 2000 * ONE_TOKEN);
+    game_stake(&mut svm, &a, &mint, 0, 1_000_000_000, 0).expect("a enters");
+    game_stake(&mut svm, &b, &mint, 1, 1_000_000_000, 0).expect("b enters");
+    game_stake(&mut svm, &c, &mint, 2, 0, 2000 * ONE_TOKEN).expect("c enters");
+
+    let round = get_game_round(&svm, 0);
+    let mut expected = [0u64; GAME_TUNNELS];
+    expected[..3].copy_from_slice(&[1_000_000_000, 1_000_000_000, 1_000_000_000]);
+    assert_eq!(round.weight, expected);
+    assert_eq!(round.entries, 3);
+    assert_eq!(token_balance(&svm, &mint, &c.pubkey()), 0);
+
+    // The draw always takes 3 of the 9 tunnels, staked or not: rig
+    // tunnels 1 (SOL), 2 (MINER) and the empty 5 to go; tunnel 0
+    // survives alone.
+    let supply_before = u64::from_le_bytes(
+        svm.get_account(&mint).unwrap().data[36..44].try_into().unwrap(),
+    );
+    rig_game(&mut svm, Some(&[1, 2, 5]), false);
+    advance_game_round(&mut svm, &admin, &mint, &pool);
+
+    let round = get_game_round(&svm, 0);
+    assert_eq!(round.settled, GAME_ROUND_SETTLED);
+    assert_eq!(round.collapsed, 0b100110);
+    assert_eq!(round.payout_sol, 900_000_000);
+    assert_eq!(round.payout_miner, 1800 * ONE_TOKEN);
+    assert_eq!(round.survivor_weight, 1_000_000_000);
+
+    // Rake: 5% of the collapsed 2000 MINER burned on the spot (real supply
+    // decrement), 5% into the players' Motherlode; the SOL side splits
+    // the same way (5% fee wallet, 5% Motherlode).
+    let supply_after = u64::from_le_bytes(
+        svm.get_account(&mint).unwrap().data[36..44].try_into().unwrap(),
+    );
+    assert_eq!(supply_before - supply_after, 100 * ONE_TOKEN);
+    let game = get_game(&svm);
+    assert_eq!(game.total_burned, 100 * ONE_TOKEN);
+    assert_eq!(game.ml_miner, 100 * ONE_TOKEN);
+    assert_eq!(game.ml_sol, 50_000_000);
+    assert_eq!(game.total_fee_sol, 50_000_000);
+    assert_eq!(game.total_rounds_played, 1);
+    assert_eq!(game.current_round, 1);
+
+    // The sole survivor claims: 1 SOL stake back + the whole payout
+    // (0.9 SOL + 1800 MINER).
+    set_balance(&mut svm, &mint, &a.pubkey(), 0);
+    let a_lamports = svm.get_account(&a.pubkey()).unwrap().lamports;
+    send(&mut svm, &[sdk::game_claim(a.pubkey(), mint, 0)], &a, &[]).expect("a claims");
+    assert_eq!(token_balance(&svm, &mint, &a.pubkey()), 1800 * ONE_TOKEN);
+    let a_gain = svm.get_account(&a.pubkey()).unwrap().lamports - a_lamports;
+    // 1 SOL stake + 0.9 SOL payout + entry rent - tx fee.
+    assert!(a_gain > 1_899_000_000 && a_gain < 1_903_000_000, "a gain {a_gain}");
+
+    // The collapsed stakes claim nothing (the entries still close).
+    set_balance(&mut svm, &mint, &b.pubkey(), 0);
+    send(&mut svm, &[sdk::game_claim(b.pubkey(), mint, 0)], &b, &[]).expect("b claims");
+    assert_eq!(token_balance(&svm, &mint, &b.pubkey()), 0);
+
+    send(&mut svm, &[sdk::game_claim(c.pubkey(), mint, 0)], &c, &[]).expect("c claims");
+    assert_eq!(token_balance(&svm, &mint, &c.pubkey()), 0);
+    assert!(svm
+        .get_account(&pda::game_entry_pda(0, &c.pubkey()).0)
+        .map(|a| a.data.is_empty())
+        .unwrap_or(true));
+
+    // Double claim fails (the entry is gone).
+    send(&mut svm, &[sdk::game_claim(a.pubkey(), mint, 0)], &a, &[])
+        .expect_err("double claim must fail");
+
+    // The vault keeps exactly the players' Motherlode share.
+    let (game_key, _) = pda::game_pda();
+    assert_eq!(
+        token_balance(&svm, &mint, &game_key),
+        100 * ONE_TOKEN
+    );
+}
+
+#[test]
+fn game_full_round_sol_tunnel_collapses() {
+    let (mut svm, admin, mint) = setup();
+    let pool = setup_game(&mut svm, &admin, &mint);
+
+    let a = Keypair::new();
+    let b = Keypair::new();
+    let c = Keypair::new();
+    for p in [&a, &b, &c] {
+        svm.airdrop(&p.pubkey(), 10_000_000_000).unwrap();
+    }
+    game_stake(&mut svm, &a, &mint, 0, 2_000_000_000, 0).expect("a enters");
+    game_stake(&mut svm, &b, &mint, 1, 1_000_000_000, 0).expect("b enters");
+    // c hedges: half on tunnel 0, half on tunnel 1.
+    game_stake(&mut svm, &c, &mint, 0, 500_000_000, 0).expect("c enters t0");
+    game_stake(&mut svm, &c, &mint, 1, 500_000_000, 0).expect("c hedges t1");
+
+    // Rig tunnel 0 plus two empty tunnels to go; tunnel 1 survives.
+    let fee_before = svm.get_account(&FEE_WALLET).unwrap().lamports;
+    rig_game(&mut svm, Some(&[0, 4, 8]), false);
+    advance_game_round(&mut svm, &admin, &mint, &pool);
+
+    // Tunnel 0 (2.5 SOL) collapsed: 0.125 SOL to the fee wallet (buyback),
+    // 0.125 SOL to the players' Motherlode, 2.25 SOL to the survivors.
+    let round = get_game_round(&svm, 0);
+    assert_eq!(round.collapsed, 0b100010001);
+    assert_eq!(round.entries, 3);
+    assert_eq!(round.payout_sol, 2_250_000_000);
+    assert_eq!(round.survivor_weight, 1_500_000_000);
+    let game = get_game(&svm);
+    assert_eq!(game.ml_sol, 125_000_000);
+    assert_eq!(game.total_fee_sol, 125_000_000);
+    assert_eq!(
+        svm.get_account(&FEE_WALLET).unwrap().lamports - fee_before,
+        125_000_000
+    );
+
+    // b: 1 SOL stake back + 2.25 * (1/1.5) = 2.5 SOL total.
+    let b_lamports = svm.get_account(&b.pubkey()).unwrap().lamports;
+    send(&mut svm, &[sdk::game_claim(b.pubkey(), mint, 0)], &b, &[]).expect("b claims");
+    let b_gain = svm.get_account(&b.pubkey()).unwrap().lamports - b_lamports;
+    assert!(
+        b_gain > 2_499_000_000 && b_gain < 2_503_000_000,
+        "b gain {b_gain}"
+    );
+
+    // c: the tunnel 0 half fell, the tunnel 1 half survived:
+    // 0.5 back + 2.25 * (0.5/1.5) = 1.25 SOL total.
+    let c_lamports = svm.get_account(&c.pubkey()).unwrap().lamports;
+    send(&mut svm, &[sdk::game_claim(c.pubkey(), mint, 0)], &c, &[]).expect("c claims");
+    let c_gain = svm.get_account(&c.pubkey()).unwrap().lamports - c_lamports;
+    assert!(
+        c_gain > 1_249_000_000 && c_gain < 1_253_000_000,
+        "c gain {c_gain}"
+    );
+}
+
+#[test]
+fn game_lone_survivor_refunds_and_total_collapse_burns() {
+    let (mut svm, admin, mint) = setup();
+    let pool = setup_game(&mut svm, &admin, &mint);
+
+    let a = Keypair::new();
+    svm.airdrop(&a.pubkey(), 10_000_000_000).unwrap();
+    set_balance(&mut svm, &mint, &a.pubkey(), 1000 * ONE_TOKEN);
+
+    // Round 0: a mixed stake, alone in the round, and the draw misses its
+    // tunnel: the collapsed pots are empty, the stake comes back in full.
+    game_stake(&mut svm, &a, &mint, 1, 500_000_000, 500 * ONE_TOKEN).expect("a enters");
+    rig_game(&mut svm, Some(&[0, 4, 8]), false);
+    advance_game_round(&mut svm, &admin, &mint, &pool);
+    let round = get_game_round(&svm, 0);
+    assert_eq!(round.settled, GAME_ROUND_SETTLED);
+    assert_eq!(round.payout_sol + round.payout_miner, 0);
+
+    let a_lamports = svm.get_account(&a.pubkey()).unwrap().lamports;
+    send(&mut svm, &[sdk::game_claim(a.pubkey(), mint, 0)], &a, &[]).expect("a claims");
+    assert_eq!(token_balance(&svm, &mint, &a.pubkey()), 1000 * ONE_TOKEN);
+    let a_gain = svm.get_account(&a.pubkey()).unwrap().lamports - a_lamports;
+    assert!(a_gain > 499_000_000 && a_gain < 503_000_000, "a gain {a_gain}");
+    let game = get_game(&svm);
+    assert_eq!(game.total_burned, 0);
+    assert_eq!(game.ml_sol + game.ml_miner, 0);
+
+    // Round 1: no staked tunnel survives: nobody to pay, so the whole
+    // pot goes to buyback/burn ($MINER burns, SOL to the fee wallet) and
+    // the claim returns only the entry rent.
+    game_stake(&mut svm, &a, &mint, 1, 500_000_000, 500 * ONE_TOKEN).expect("a re-enters");
+    let fee_before = svm.get_account(&FEE_WALLET).unwrap().lamports;
+    rig_game(&mut svm, Some(&[1, 4, 8]), false);
+    advance_game_round(&mut svm, &admin, &mint, &pool);
+    let round = get_game_round(&svm, 1);
+    assert_eq!(round.settled, GAME_ROUND_SETTLED);
+    assert_eq!(round.survivor_weight, 0);
+    assert_eq!(round.payout_sol + round.payout_miner, 0);
+    let game = get_game(&svm);
+    assert_eq!(game.total_burned, 500 * ONE_TOKEN);
+    assert_eq!(game.total_fee_sol, 500_000_000);
+    assert_eq!(game.ml_sol + game.ml_miner, 0);
+    assert_eq!(
+        svm.get_account(&FEE_WALLET).unwrap().lamports - fee_before,
+        500_000_000
+    );
+
+    let a_lamports = svm.get_account(&a.pubkey()).unwrap().lamports;
+    send(&mut svm, &[sdk::game_claim(a.pubkey(), mint, 1)], &a, &[]).expect("a claims r1");
+    assert_eq!(token_balance(&svm, &mint, &a.pubkey()), 500 * ONE_TOKEN);
+    let a_gain = svm.get_account(&a.pubkey()).unwrap().lamports - a_lamports;
+    // Only the entry rent comes back.
+    assert!(a_gain < 5_000_000, "a gain {a_gain}");
+}
+
+#[test]
+fn game_enter_guards() {
+    let (mut svm, admin, mint) = setup();
+    let pool = setup_game(&mut svm, &admin, &mint);
+
+    let a = Keypair::new();
+    svm.airdrop(&a.pubkey(), 10_000_000_000).unwrap();
+
+    // Invalid tunnel.
+    let err =
+        game_stake(&mut svm, &a, &mint, GAME_TUNNELS as u8, 1_000_000_000, 0).unwrap_err();
+    assert!(err.contains("Custom(19)"), "expected InvalidTunnel: {err}");
+
+    // Below the minimum stake value.
+    let err = game_stake(&mut svm, &a, &mint, 0, GAME_MIN_WEIGHT - 1, 0).unwrap_err();
+    assert!(err.contains("Custom(24)"), "expected InvalidStake: {err}");
+
+    // One wallet can spread the round's stake across tunnels (the hedge)
+    // and top up a tunnel it already staked; it still counts as one
+    // player (entries do not recount).
+    game_stake(&mut svm, &a, &mint, 0, 1_000_000_000, 0).expect("a enters");
+    game_stake(&mut svm, &a, &mint, 1, 750_000_000, 0).expect("hedge on tunnel 1");
+    game_stake(&mut svm, &a, &mint, 0, 1_500_000_000, 0).expect("top-up");
+    let round = get_game_round(&svm, 0);
+    assert_eq!(round.entries, 1);
+    assert_eq!(round.weight[0], 2_500_000_000);
+    assert_eq!(round.weight[1], 750_000_000);
+    let entry: GameEntry = get_state(&svm, &pda::game_entry_pda(0, &a.pubkey()).0);
+    let mut expected = [0u64; GAME_TUNNELS];
+    expected[..2].copy_from_slice(&[2_500_000_000, 750_000_000]);
+    assert_eq!(entry.sol, expected);
+    assert_eq!(entry.weight, expected);
+
+    // Claim before settle fails.
+    let err = send(&mut svm, &[sdk::game_claim(a.pubkey(), mint, 0)], &a, &[])
+        .unwrap_err();
+    assert!(err.contains("Custom(22)"), "expected GameNotSettled: {err}");
+
+    // Settle before the deadline fails.
+    let game = get_game(&svm);
+    let round0 = get_game_round(&svm, 0);
+    let err = send(
+        &mut svm,
+        &[sdk::game_settle(
+            admin.pubkey(),
+            mint,
+            pool,
+            game.current_round + 1,
+            round0.candidates.map(Pubkey::new_from_array),
+        )],
+        &admin,
+        &[],
+    )
+    .unwrap_err();
+    assert!(err.contains("Custom(20)"), "expected RoundStillOpen: {err}");
+
+    // Entries close at the deadline even before the settle runs.
+    let mut clock: Clock = svm.get_sysvar();
+    clock.unix_timestamp = game.round_start_ts + game.round_seconds as i64 + 1;
+    svm.set_sysvar(&clock);
+    svm.expire_blockhash();
+    let err = game_stake(&mut svm, &a, &mint, 0, 1_000_000_000, 0).unwrap_err();
+    assert!(err.contains("Custom(21)"), "expected GameRoundClosed: {err}");
+
+    // After the settle the next round sits in its intermission: entries
+    // stay closed until start_ts, then open.
+    game_settle_now(&mut svm, &admin, &mint, &pool);
+    let game = get_game(&svm);
+    let clock: Clock = svm.get_sysvar();
+    assert!(
+        clock.unix_timestamp < game.round_start_ts,
+        "the new round must start after an intermission"
+    );
+    let err = game_stake(&mut svm, &a, &mint, 0, 1_000_000_000, 0).unwrap_err();
+    assert!(err.contains("Custom(21)"), "expected GameRoundClosed: {err}");
+    let mut clock: Clock = svm.get_sysvar();
+    clock.unix_timestamp = game.round_start_ts + 1;
+    svm.set_sysvar(&clock);
+    svm.expire_blockhash();
+    game_stake(&mut svm, &a, &mint, 0, 1_000_000_000, 0)
+        .expect("entry after the intermission");
+}
+
+#[test]
+fn game_motherlode_strike_and_claim() {
+    let (mut svm, admin, mint) = setup();
+    let pool = setup_game(&mut svm, &admin, &mint);
+
+    let a = Keypair::new();
+    let b = Keypair::new();
+    let c = Keypair::new();
+    for p in [&a, &b, &c] {
+        svm.airdrop(&p.pubkey(), 10_000_000_000).unwrap();
+    }
+
+    // Round 0: a SOL tunnel collapses -> the pools get SOL.
+    game_stake(&mut svm, &a, &mint, 0, 2_000_000_000, 0).expect("a enters");
+    game_stake(&mut svm, &b, &mint, 1, 1_000_000_000, 0).expect("b enters");
+    rig_game(&mut svm, Some(&[0, 4, 8]), false);
+    advance_game_round(&mut svm, &admin, &mint, &pool);
+
+    // Round 1: a MINER tunnel collapses -> the pools get MINER too.
+    set_balance(&mut svm, &mint, &c.pubkey(), 2000 * ONE_TOKEN);
+    game_stake(&mut svm, &c, &mint, 2, 0, 2000 * ONE_TOKEN).expect("c enters");
+    game_stake(&mut svm, &b, &mint, 1, 1_000_000_000, 0).expect("b enters r1");
+    rig_game(&mut svm, Some(&[2, 4, 8]), false);
+    advance_game_round(&mut svm, &admin, &mint, &pool);
+
+    let game = get_game(&svm);
+    assert_eq!(game.ml_sol, 100_000_000);
+    assert_eq!(game.ml_miner, 100 * ONE_TOKEN);
+
+    // Round 2: d plays alone, its tunnel survives the draw, and the
+    // strike hits. As the only wallet, d holds all candidate slots and
+    // takes the whole pools.
+    let d = Keypair::new();
+    svm.airdrop(&d.pubkey(), 10_000_000_000).unwrap();
+    game_stake(&mut svm, &d, &mint, 0, 1_000_000_000, 0).expect("d enters");
+    let round = get_game_round(&svm, 2);
+    assert_eq!(round.candidates, [d.pubkey().to_bytes(); GAME_MOTHERLODE_WINNERS]);
+    rig_game(&mut svm, Some(&[4, 7, 8]), true);
+    advance_game_round(&mut svm, &admin, &mint, &pool);
+
+    let game = get_game(&svm);
+    assert_eq!(game.ml_sol, 0);
+    assert_eq!(game.ml_miner, 0);
+    assert_eq!(game.ml_last_winners[0], d.pubkey().to_bytes());
+    let win = get_game_win(&svm, &d.pubkey());
+    assert_eq!(win.sol, 100_000_000);
+    assert_eq!(win.miner, 100 * ONE_TOKEN);
+
+    // d claims the win: both assets arrive, the win PDA closes.
+    set_balance(&mut svm, &mint, &d.pubkey(), 0);
+    let d_lamports = svm.get_account(&d.pubkey()).unwrap().lamports;
+    send(&mut svm, &[sdk::game_claim_win(d.pubkey(), mint)], &d, &[])
+        .expect("d claims win");
+    assert_eq!(token_balance(&svm, &mint, &d.pubkey()), 100 * ONE_TOKEN);
+    let d_gain = svm.get_account(&d.pubkey()).unwrap().lamports - d_lamports;
+    assert!(d_gain > 99_000_000 && d_gain < 103_000_000, "d gain {d_gain}");
+    send(&mut svm, &[sdk::game_claim_win(d.pubkey(), mint)], &d, &[])
+        .expect_err("double win claim must fail");
+
+    // d's surviving entry still refunds in full (empty pots, no payout).
+    let d_lamports = svm.get_account(&d.pubkey()).unwrap().lamports;
+    send(&mut svm, &[sdk::game_claim(d.pubkey(), mint, 2)], &d, &[]).expect("d refund");
+    let d_gain = svm.get_account(&d.pubkey()).unwrap().lamports - d_lamports;
+    assert!(d_gain > 999_000_000, "d refund {d_gain}");
+}
+
+#[test]
+fn game_ema_steps_and_clamps() {
+    let (mut svm, admin, mint) = setup();
+    let pool = setup_game(&mut svm, &admin, &mint);
+
+    // Spot moves to ~600_000: the EMA steps by (spot - ema) / 8.
+    let acc = pool_account(&mint, 600_000);
+    let spot = expected_spot(&acc);
+    svm.set_account(pool, acc).unwrap();
+    advance_game_round(&mut svm, &admin, &mint, &pool);
+    let ema1 = get_game(&svm).ema_lamports_per_token;
+    assert_eq!(ema1, GAME_EMA + (spot - GAME_EMA) / GAME_EMA_ALPHA);
+
+    // Spot 10x: the per-settle move clamps at +5%.
+    svm.set_account(pool, pool_account(&mint, 5_000_000)).unwrap();
+    advance_game_round(&mut svm, &admin, &mint, &pool);
+    let ema2 = get_game(&svm).ema_lamports_per_token;
+    assert_eq!(
+        ema2,
+        ((ema1 as u128) * ((BPS_DENOM + GAME_EMA_CLAMP_BPS) as u128) / (BPS_DENOM as u128))
+            as u64
+    );
+
+    // Spot crash: clamps at -5% per settle.
+    svm.set_account(pool, pool_account(&mint, 50_000)).unwrap();
+    advance_game_round(&mut svm, &admin, &mint, &pool);
+    let ema3 = get_game(&svm).ema_lamports_per_token;
+    assert_eq!(
+        ema3,
+        ((ema2 as u128) * ((BPS_DENOM - GAME_EMA_CLAMP_BPS) as u128) / (BPS_DENOM as u128))
+            as u64
+    );
+
+    // A foreign account in the pool slot is rejected.
+    let game = get_game(&svm);
+    let round = get_game_round(&svm, game.current_round);
+    let mut clock: Clock = svm.get_sysvar();
+    clock.unix_timestamp = game.round_start_ts + game.round_seconds as i64 + 1;
+    svm.set_sysvar(&clock);
+    svm.expire_blockhash();
+    let err = send(
+        &mut svm,
+        &[sdk::game_settle(
+            admin.pubkey(),
+            mint,
+            Pubkey::new_unique(),
+            game.current_round + 1,
+            round.candidates.map(Pubkey::new_from_array),
+        )],
+        &admin,
+        &[],
+    )
+    .unwrap_err();
+    assert!(err.contains("Custom(1)"), "expected InvalidAccount: {err}");
+}

@@ -120,6 +120,62 @@ pub enum MinerInstruction {
     ///           mint, treasury (PDA), token_account (authority ATA),
     ///           treasury_token (treasury ATA), token_program]
     ClaimMotherlode = 14,
+
+    /// Create the Tunnels game state (admin-gated, once): the "game" PDA,
+    /// the SOL vault PDA and game round 0. The $MINER vault (the game
+    /// PDA's ATA) is created client-side. The pool account is stored as
+    /// the EMA price source.
+    /// Accounts: [admin (signer, payer), config, game (PDA),
+    ///           game_vault (PDA), round0 (PDA), pool, system_program]
+    /// Data: initial EMA u64 LE (lamports per whole token)
+    InitGame = 15,
+
+    /// Stake SOL and/or $MINER on a tunnel in the current game round.
+    /// Creates the entry PDA or tops it up (same tunnel only). A new entry
+    /// buys one players' Motherlode ticket (reservoir sampling, one per
+    /// wallet per round regardless of stake). Must be signed by the
+    /// authority itself.
+    /// Accounts: [authority (signer, payer), game, game_round, entry (PDA),
+    ///           game_vault (PDA), user token account, game token vault
+    ///           (game PDA's ATA), config, slot_hashes, token_program,
+    ///           system_program]
+    /// Data: tunnel u8, sol u64 LE, miner u64 LE
+    GameEnter = 16,
+
+    /// Close the current game round and open the next (permissionless
+    /// crank). With >= 2 staked tunnels: draws the collapsing tunnel with
+    /// probability proportional to tunnel weight (entropy from slot
+    /// hashes, unknown while entries were open), burns GAME_BURN_BPS of
+    /// the collapsed pot's $MINER side, routes GAME_BURN_BPS of its SOL
+    /// side to the fee wallet (the daily buyback), credits
+    /// GAME_MOTHERLODE_BPS of both sides to the players' Motherlode and
+    /// freezes the 90% payout for survivor claims. Otherwise the round is
+    /// void (full refunds). Also updates the price EMA from the pool and
+    /// rolls the players' Motherlode strike (1/GAME_MOTHERLODE_ODDS; the
+    /// pools split evenly into the candidates' GameWin accounts).
+    /// Accounts: [payer (signer), game, closing_round, new_round (PDA),
+    ///           game_vault (PDA), game token vault, config, mint,
+    ///           fee_wallet (FEE_WALLET), pool, slot_hashes,
+    ///           token_program, system_program,
+    ///           game_win_0..game_win_2 (candidates' PDAs, slot order)]
+    GameSettle = 17,
+
+    /// Claim a settled game entry: survivor payout (pro-rata share of the
+    /// collapsed pot) or a full refund for a void round; a collapsed stake
+    /// claims nothing. Closes the entry PDA (rent to the authority either
+    /// way). Must be signed by the authority itself.
+    /// Accounts: [authority (signer), game, game_round, entry (PDA),
+    ///           game_vault (PDA), user token account, game token vault,
+    ///           token_program]
+    GameClaim = 18,
+
+    /// Claim a players' Motherlode win: the SOL and $MINER amounts move
+    /// from the game vaults to the winner. Closes the GameWin PDA (rent to
+    /// the winner). Must be signed by the authority itself.
+    /// Accounts: [authority (signer), game, game_win (PDA),
+    ///           game_vault (PDA), user token account, game token vault,
+    ///           token_program]
+    GameClaimWin = 19,
 }
 
 impl MinerInstruction {
@@ -140,6 +196,11 @@ impl MinerInstruction {
             12 => Self::Unlock,
             13 => Self::InitMotherlode,
             14 => Self::ClaimMotherlode,
+            15 => Self::InitGame,
+            16 => Self::GameEnter,
+            17 => Self::GameSettle,
+            18 => Self::GameClaim,
+            19 => Self::GameClaimWin,
             _ => return None,
         })
     }

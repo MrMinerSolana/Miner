@@ -3,6 +3,11 @@ mod claim;
 mod claim_motherlode;
 mod close_round;
 mod crank;
+mod game_claim;
+mod game_claim_win;
+mod game_enter;
+mod game_settle;
+mod init_game;
 mod init_motherlode;
 mod initialize;
 mod loaders;
@@ -53,5 +58,10 @@ pub fn process_instruction(
         MinerInstruction::Unlock => unlock::process(accounts),
         MinerInstruction::InitMotherlode => init_motherlode::process(accounts),
         MinerInstruction::ClaimMotherlode => claim_motherlode::process(accounts),
+        MinerInstruction::InitGame => init_game::process(accounts, rest),
+        MinerInstruction::GameEnter => game_enter::process(accounts, rest),
+        MinerInstruction::GameSettle => game_settle::process(accounts),
+        MinerInstruction::GameClaim => game_claim::process(accounts),
+        MinerInstruction::GameClaimWin => game_claim_win::process(accounts),
     }
 }

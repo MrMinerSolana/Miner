@@ -1,6 +1,6 @@
 use bytemuck::{Pod, Zeroable};
 
-use crate::consts::MOTHERLODE_WINNERS;
+use crate::consts::{GAME_MOTHERLODE_WINNERS, GAME_TUNNELS, MOTHERLODE_WINNERS};
 
 /// Account discriminators.
 pub const CONFIG_DISCRIMINATOR: u64 = 1;
@@ -11,6 +11,10 @@ pub const REFNAME_DISCRIMINATOR: u64 = 5;
 pub const LOCK_DISCRIMINATOR: u64 = 6;
 pub const MOTHERLODE_DISCRIMINATOR: u64 = 7;
 pub const WIN_DISCRIMINATOR: u64 = 8;
+pub const GAME_DISCRIMINATOR: u64 = 9;
+pub const GAME_ROUND_DISCRIMINATOR: u64 = 10;
+pub const GAME_ENTRY_DISCRIMINATOR: u64 = 11;
+pub const GAME_WIN_DISCRIMINATOR: u64 = 12;
 
 /// Global program configuration ("config" PDA, singleton).
 #[repr(C)]
@@ -219,8 +223,126 @@ impl RefName {
     }
 }
 
+/// Tunnels game state ("game" PDA, singleton created by InitGame).
+/// Holds the round cursor, the EMA price used to value $MINER stakes in
+/// lamports, and the players' Motherlode pools (funds physically sit in
+/// the game vaults; these are counters). Also the lifetime stats the UI
+/// shows.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct Game {
+    pub discriminator: u64,
+    /// Index of the current (open) game round.
+    pub current_round: u64,
+    /// Start timestamp of the current round.
+    pub round_start_ts: i64,
+    /// Round length in seconds (frozen from GAME_ROUND_SECONDS at init).
+    pub round_seconds: u64,
+    /// EMA of the $MINER price in lamports per whole token; values the
+    /// $MINER side of stakes. Updated once per settle from the pool spot,
+    /// clamped to GAME_EMA_CLAMP_BPS per update.
+    pub ema_lamports_per_token: u64,
+    /// The cp-amm pool the EMA reads (fixed at init).
+    pub pool: [u8; 32],
+    /// Players' Motherlode pools (lamports / native $MINER).
+    pub ml_sol: u64,
+    pub ml_miner: u64,
+    /// The most recent players' strike, informational for the UI.
+    pub ml_last_winners: [[u8; 32]; GAME_MOTHERLODE_WINNERS],
+    pub ml_last_sol: u64,
+    pub ml_last_miner: u64,
+    pub ml_last_ts: i64,
+    /// Lifetime stats: $MINER burned by the rake, SOL routed to the fee
+    /// wallet (daily buyback), staked volume per asset, settled rounds
+    /// with a collapse.
+    pub total_burned: u64,
+    pub total_fee_sol: u64,
+    pub total_volume_sol: u64,
+    pub total_volume_miner: u64,
+    pub total_rounds_played: u64,
+    /// PDA bumps (game + SOL vault).
+    pub bump: u64,
+    pub vault_bump: u64,
+}
+
+/// One game round ("game_round" PDA + LE index). Open while index ==
+/// Game.current_round and now < start_ts + round_seconds; GameSettle then
+/// rolls the collapse and freezes the payout numbers claims divide by.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct GameRound {
+    pub discriminator: u64,
+    pub index: u64,
+    pub start_ts: i64,
+    /// Stakes per tunnel, split by asset (lamports / native $MINER).
+    pub sol: [u64; GAME_TUNNELS],
+    pub miner: [u64; GAME_TUNNELS],
+    /// Stake value per tunnel in lamport-equivalent (sol + miner * ema),
+    /// frozen per entry at entry time (the EMA only moves between rounds).
+    pub weight: [u64; GAME_TUNNELS],
+    /// Wallets that entered (one per wallet; top-ups do not recount).
+    pub entries: u64,
+    /// Players' Motherlode candidates: independent reservoir samples over
+    /// the round's wallets, one ticket per wallet regardless of stake.
+    pub candidates: [[u8; 32]; GAME_MOTHERLODE_WINNERS],
+    /// GAME_ROUND_OPEN / SETTLED / VOID.
+    pub settled: u64,
+    /// Bitmask of the collapsed tunnels (valid when settled == SETTLED).
+    pub collapsed: u64,
+    /// 90% of the collapsed pots, what survivors share pro-rata.
+    pub payout_sol: u64,
+    pub payout_miner: u64,
+    /// Total weight of the surviving tunnels (the claim divisor).
+    pub survivor_weight: u64,
+}
+
+/// A wallet's stake in one round ("game_entry" PDA + LE round + authority),
+/// created by GameEnter (top-ups merge into it, same tunnel only), closed
+/// by GameClaim (payout / refund / nothing for a collapsed stake; rent
+/// back to the authority either way).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct GameEntry {
+    pub discriminator: u64,
+    pub authority: [u8; 32],
+    pub round: u64,
+    /// Stakes per tunnel: a wallet can spread one round's stake across
+    /// any number of tunnels (the hedge is part of the game).
+    pub sol: [u64; GAME_TUNNELS],
+    pub miner: [u64; GAME_TUNNELS],
+    /// Lamport-equivalent stake value per tunnel (claim numerators).
+    pub weight: [u64; GAME_TUNNELS],
+    pub bump: u64,
+}
+
+/// A won, not-yet-claimed players' Motherlode strike ("game_win" PDA +
+/// authority), created by GameSettle at the strike, closed by GameClaimWin.
+/// Striking again before claiming adds to the amounts.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct GameWin {
+    pub discriminator: u64,
+    pub authority: [u8; 32],
+    pub sol: u64,
+    pub miner: u64,
+    pub since_ts: i64,
+    pub bump: u64,
+}
+
 impl Config {
     pub const SIZE: usize = core::mem::size_of::<Config>();
+}
+impl Game {
+    pub const SIZE: usize = core::mem::size_of::<Game>();
+}
+impl GameRound {
+    pub const SIZE: usize = core::mem::size_of::<GameRound>();
+}
+impl GameEntry {
+    pub const SIZE: usize = core::mem::size_of::<GameEntry>();
+}
+impl GameWin {
+    pub const SIZE: usize = core::mem::size_of::<GameWin>();
 }
 impl RefName {
     pub const SIZE: usize = core::mem::size_of::<RefName>();

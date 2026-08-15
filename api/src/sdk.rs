@@ -367,6 +367,129 @@ pub fn set_admin(admin: Pubkey, new_admin: Pubkey) -> Instruction {
     }
 }
 
+/// Create the Tunnels game state (admin only, once). The $MINER vault
+/// (the game PDA's ATA) must be created client-side in the same
+/// transaction (idempotent create-ATA).
+pub fn init_game(admin: Pubkey, pool: Pubkey, initial_ema: u64) -> Instruction {
+    let mut data = vec![MinerInstruction::InitGame as u8];
+    data.extend_from_slice(&initial_ema.to_le_bytes());
+    Instruction {
+        program_id: crate::id(),
+        accounts: vec![
+            AccountMeta::new(admin, true),
+            AccountMeta::new_readonly(pda::config_pda().0, false),
+            AccountMeta::new(pda::game_pda().0, false),
+            AccountMeta::new(pda::game_vault_pda().0, false),
+            AccountMeta::new(pda::game_round_pda(0).0, false),
+            AccountMeta::new_readonly(pool, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+        ],
+        data,
+    }
+}
+
+/// Stake on a tunnel in the current game round (creates or tops up the
+/// entry). The game token vault must exist (created once, client-side).
+pub fn game_enter(
+    authority: Pubkey,
+    mint: Pubkey,
+    round_index: u64,
+    tunnel: u8,
+    sol: u64,
+    miner: u64,
+) -> Instruction {
+    let mut data = vec![MinerInstruction::GameEnter as u8, tunnel];
+    data.extend_from_slice(&sol.to_le_bytes());
+    data.extend_from_slice(&miner.to_le_bytes());
+    Instruction {
+        program_id: crate::id(),
+        accounts: vec![
+            AccountMeta::new(authority, true),
+            AccountMeta::new(pda::game_pda().0, false),
+            AccountMeta::new(pda::game_round_pda(round_index).0, false),
+            AccountMeta::new(pda::game_entry_pda(round_index, &authority).0, false),
+            AccountMeta::new(pda::game_vault_pda().0, false),
+            AccountMeta::new(pda::ata(&authority, &mint), false),
+            AccountMeta::new(pda::game_token_vault(&mint), false),
+            AccountMeta::new_readonly(pda::config_pda().0, false),
+            AccountMeta::new_readonly(SLOT_HASHES_SYSVAR_ID, false),
+            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+        ],
+        data,
+    }
+}
+
+/// Settle the current game round and open the next (permissionless).
+/// `candidates` are the closing round's players' Motherlode candidate
+/// slots, in slot order (Pubkey::default() when the round had no entries).
+pub fn game_settle(
+    payer: Pubkey,
+    mint: Pubkey,
+    pool: Pubkey,
+    new_round_index: u64,
+    candidates: [Pubkey; GAME_MOTHERLODE_WINNERS],
+) -> Instruction {
+    let mut accounts = vec![
+        AccountMeta::new(payer, true),
+        AccountMeta::new(pda::game_pda().0, false),
+        AccountMeta::new(pda::game_round_pda(new_round_index - 1).0, false),
+        AccountMeta::new(pda::game_round_pda(new_round_index).0, false),
+        AccountMeta::new(pda::game_vault_pda().0, false),
+        AccountMeta::new(pda::game_token_vault(&mint), false),
+        AccountMeta::new_readonly(pda::config_pda().0, false),
+        AccountMeta::new(mint, false),
+        AccountMeta::new(FEE_WALLET, false),
+        AccountMeta::new_readonly(pool, false),
+        AccountMeta::new_readonly(SLOT_HASHES_SYSVAR_ID, false),
+        AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+    ];
+    for candidate in candidates {
+        accounts.push(AccountMeta::new(pda::game_win_pda(&candidate).0, false));
+    }
+    Instruction {
+        program_id: crate::id(),
+        accounts,
+        data: vec![MinerInstruction::GameSettle as u8],
+    }
+}
+
+/// Claim a settled game entry (payout / refund / close).
+pub fn game_claim(authority: Pubkey, mint: Pubkey, round_index: u64) -> Instruction {
+    Instruction {
+        program_id: crate::id(),
+        accounts: vec![
+            AccountMeta::new(authority, true),
+            AccountMeta::new_readonly(pda::game_pda().0, false),
+            AccountMeta::new_readonly(pda::game_round_pda(round_index).0, false),
+            AccountMeta::new(pda::game_entry_pda(round_index, &authority).0, false),
+            AccountMeta::new(pda::game_vault_pda().0, false),
+            AccountMeta::new(pda::ata(&authority, &mint), false),
+            AccountMeta::new(pda::game_token_vault(&mint), false),
+            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+        ],
+        data: vec![MinerInstruction::GameClaim as u8],
+    }
+}
+
+/// Claim a players' Motherlode win.
+pub fn game_claim_win(authority: Pubkey, mint: Pubkey) -> Instruction {
+    Instruction {
+        program_id: crate::id(),
+        accounts: vec![
+            AccountMeta::new(authority, true),
+            AccountMeta::new_readonly(pda::game_pda().0, false),
+            AccountMeta::new(pda::game_win_pda(&authority).0, false),
+            AccountMeta::new(pda::game_vault_pda().0, false),
+            AccountMeta::new(pda::ata(&authority, &mint), false),
+            AccountMeta::new(pda::game_token_vault(&mint), false),
+            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+        ],
+        data: vec![MinerInstruction::GameClaimWin as u8],
+    }
+}
+
 /// Client-side hash verification (identical logic to the on-chain program).
 pub fn hash_meets_difficulty(
     challenge: &[u8; 32],

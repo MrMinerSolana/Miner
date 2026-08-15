@@ -44,6 +44,21 @@ pub enum MinerError {
     InvalidLockAmount = 17,
     /// The lock has not expired yet.
     LockNotExpired = 18,
+    /// Tunnel index outside 0..GAME_TUNNELS.
+    InvalidTunnel = 19,
+    /// The game round is still open (settle too early).
+    GameRoundStillOpen = 20,
+    /// The game round no longer accepts entries (past the deadline or not
+    /// the current round).
+    GameRoundClosed = 21,
+    /// The game round has not been settled yet (claim too early).
+    GameNotSettled = 22,
+    /// A top-up must stay in the tunnel of the original entry.
+    GameTunnelMismatch = 23,
+    /// Stake below the minimum (or both amounts zero).
+    InvalidStake = 24,
+    /// The pool account does not carry a readable spot price.
+    InvalidPool = 25,
 }
 
 impl From<MinerError> for ProgramError {

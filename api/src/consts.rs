@@ -269,6 +269,83 @@ pub const MINE_FEE_LAMPORTS: u64 = 5000;
 /// burns them.
 pub const FEE_WALLET: Pubkey = pubkey!("D9pvV1SQqYU8d2zcZHkhAdkzuZKaXntkKSNFLsvQvxxu");
 
+/// ---------------------------------------------------------------------
+/// Tunnels: the PvP crowd game. Players stake SOL and/or $MINER on any of
+/// GAME_TUNNELS tunnels each round; at round close GAME_COLLAPSES tunnels
+/// cave in, drawn uniformly among all of them regardless of stakes.
+/// Survivors split 90% of the collapsed pots pro-rata to their stake
+/// value; of the remaining rake, half burns and half feeds the players'
+/// Motherlode (a separate pool from the miners' one), which strikes a
+/// random round with equal odds per participating wallet.
+///
+/// $MINER stakes are valued in lamports through an EMA of the pool spot
+/// price, updated once per settle and clamped per update, so a flash pump
+/// around a snapshot cannot move the weights.
+pub const GAME_TUNNELS: usize = 9;
+
+/// Rake, in bps of the collapsed pot: the burn half and the players'
+/// Motherlode half. Survivors share the rest (90%).
+pub const GAME_BURN_BPS: u64 = 500;
+pub const GAME_MOTHERLODE_BPS: u64 = 500;
+
+/// How many tunnels cave in per settle, drawn uniformly among ALL of the
+/// tunnels, staked or not: who is inside plays no part in what falls.
+/// Every staked tunnel therefore faces the same GAME_COLLAPSES-in-
+/// GAME_TUNNELS collapse odds each round. When no staked tunnel survives
+/// the whole collapsed pot goes to buyback/burn.
+pub const GAME_COLLAPSES: usize = 3;
+
+/// Round length in seconds (frozen into Game at init_game): 1-minute
+/// rounds, same cadence as mining.
+pub const GAME_ROUND_SECONDS: u64 = 60;
+
+/// Break between rounds, in seconds: after a settle the next round opens
+/// this much later, giving everyone a beat to read the result. Entries
+/// before the round's start_ts are rejected.
+pub const GAME_INTERMISSION_SECONDS: i64 = 15;
+
+/// Players' Motherlode strike odds: 1 in N settles of a played round.
+/// At one-minute rounds plus the intermission that is on average one
+/// strike every ~12.5 hours of continuous play.
+#[cfg(not(feature = "short-game"))]
+pub const GAME_MOTHERLODE_ODDS: u64 = 600;
+/// Devnet rehearsal (`--features short-game`): a strike every ~3 rounds.
+#[cfg(feature = "short-game")]
+pub const GAME_MOTHERLODE_ODDS: u64 = 3;
+
+/// How many candidate slots a players' strike pays out to (independent
+/// reservoir samples over the round's wallets, one ticket per wallet).
+pub const GAME_MOTHERLODE_WINNERS: usize = 3;
+
+/// Minimum stake value per entry (and per top-up), in lamport-equivalent
+/// weight: 0.001 SOL.
+pub const GAME_MIN_WEIGHT: u64 = 1_000_000;
+
+/// EMA of the $MINER price in lamports per whole token: on every settle
+/// ema += (spot - ema) / GAME_EMA_ALPHA, and the per-settle move is
+/// clamped to GAME_EMA_CLAMP_BPS. Manipulating the weights therefore
+/// requires holding a pumped pool price across many rounds, with the
+/// whole market free to sell into it.
+pub const GAME_EMA_ALPHA: u64 = 8;
+pub const GAME_EMA_CLAMP_BPS: u64 = 500;
+
+/// GameRound.settled states.
+pub const GAME_ROUND_OPEN: u64 = 0;
+pub const GAME_ROUND_SETTLED: u64 = 1;
+/// Nothing staked in the round: entries refund in full. (When staked
+/// tunnels all collapse the round still settles: the whole pot goes to
+/// buyback/burn.)
+pub const GAME_ROUND_VOID: u64 = 2;
+
+/// cp-amm (Meteora DAMM v2) Pool account offsets used by the EMA read:
+/// token_a_mint, token_b_mint, sqrt_price (u128, Q64.64).
+pub const CP_AMM_TOKEN_A_OFFSET: usize = 168;
+pub const CP_AMM_TOKEN_B_OFFSET: usize = 200;
+pub const CP_AMM_SQRT_PRICE_OFFSET: usize = 456;
+
+/// Wrapped SOL mint (the other side of the MINER pool).
+pub const WSOL_MINT: Pubkey = pubkey!("So11111111111111111111111111111111111111112");
+
 /// Custom referral name (vanity code) length bounds. Charset: a-z 0-9 _
 /// (lowercase only, clients normalize before sending). First come, first
 /// served; one name per miner; immutable. Rent makes mass squatting cost
@@ -289,6 +366,12 @@ pub const WIN_SEED: &[u8] = b"win";
 pub const REFNAME_SEED: &[u8] = b"refname";
 /// owner -> name (reverse lookup for UI + enforces one name per miner).
 pub const REFNAME_OWNER_SEED: &[u8] = b"refname_owner";
+/// Tunnels PDA seeds.
+pub const GAME_SEED: &[u8] = b"game";
+pub const GAME_VAULT_SEED: &[u8] = b"game_vault";
+pub const GAME_ROUND_SEED: &[u8] = b"game_round";
+pub const GAME_ENTRY_SEED: &[u8] = b"game_entry";
+pub const GAME_WIN_SEED: &[u8] = b"game_win";
 
 /// External programs (canonical addresses).
 pub const SPL_TOKEN_PROGRAM_ID: Pubkey = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
