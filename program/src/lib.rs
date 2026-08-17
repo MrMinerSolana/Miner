@@ -1,7 +1,9 @@
 mod authorize_session;
+mod buy_tickets;
 mod claim;
 mod claim_motherlode;
 mod close_round;
+mod close_ticket_batch;
 mod crank;
 mod game_claim;
 mod game_claim_win;
@@ -10,6 +12,7 @@ mod game_enter;
 mod game_settle;
 mod init_game;
 mod init_motherlode;
+mod init_tickets;
 mod initialize;
 mod loaders;
 mod lock;
@@ -18,6 +21,7 @@ mod register;
 mod set_admin;
 mod set_referrer;
 mod set_refname;
+mod settle_ticket_win;
 mod unlock;
 mod update_config;
 
@@ -65,5 +69,9 @@ pub fn process_instruction(
         MinerInstruction::GameClaim => game_claim::process(accounts),
         MinerInstruction::GameClaimWin => game_claim_win::process(accounts),
         MinerInstruction::GameCloseRound => game_close_round::process(accounts),
+        MinerInstruction::InitTickets => init_tickets::process(accounts),
+        MinerInstruction::BuyTickets => buy_tickets::process(accounts, rest),
+        MinerInstruction::SettleTicketWin => settle_ticket_win::process(accounts),
+        MinerInstruction::CloseTicketBatch => close_ticket_batch::process(accounts),
     }
 }

@@ -242,6 +242,16 @@ pub const MOTHERLODE_ODDS: u64 = 1440;
 #[cfg(feature = "short-motherlode")]
 pub const MOTHERLODE_ODDS: u64 = 1;
 
+/// Motherlode tickets: anyone can buy extra strike chances for burned
+/// $MINER. The full price of every ticket is credited to the pot (so
+/// ticket sales stack the jackpot 1:1 while the payment itself burns),
+/// and tickets stay valid from strike to strike (a sale epoch). A strike
+/// with any tickets sold splits the pot across MOTHERLODE_WINNERS + 1
+/// shares: the mining candidates keep theirs exactly as before, the
+/// extra share goes to one ticket drawn uniformly (weighted by ticket
+/// count per wallet by construction).
+pub const TICKET_PRICE: u64 = ONE_TOKEN; // 1 $MINER = 1 ticket
+
 /// The miners' cut of a full round budget: what Round.budget stores. The
 /// Motherlode share is withheld at round open and credited to the pool
 /// when the round closes with any weight (empty rounds keep burning
@@ -368,6 +378,8 @@ pub const REFERRAL_SEED: &[u8] = b"referral";
 pub const LOCK_SEED: &[u8] = b"lock";
 pub const MOTHERLODE_SEED: &[u8] = b"motherlode";
 pub const WIN_SEED: &[u8] = b"win";
+pub const TICKET_STATE_SEED: &[u8] = b"tickets";
+pub const TICKET_BATCH_SEED: &[u8] = b"ticket_batch";
 /// name -> owner (uniqueness + resolution of ?ref=<name> links).
 pub const REFNAME_SEED: &[u8] = b"refname";
 /// owner -> name (reverse lookup for UI + enforces one name per miner).

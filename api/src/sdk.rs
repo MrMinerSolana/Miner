@@ -274,6 +274,10 @@ pub fn crank(
     for candidate in candidates {
         accounts.push(AccountMeta::new(pda::win_pda(&candidate).0, false));
     }
+    // Trailing optional account: the ticket sale state. With it a strike
+    // also runs the ticket draw (see BuyTickets); without it the program
+    // still cranks fine and the pot splits the classic 3 ways.
+    accounts.push(AccountMeta::new(pda::ticket_state_pda().0, false));
     Instruction {
         program_id: crate::id(),
         accounts,
@@ -315,6 +319,85 @@ pub fn claim_motherlode(authority: Pubkey, mint: Pubkey) -> Instruction {
             AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
         ],
         data: vec![MinerInstruction::ClaimMotherlode as u8],
+    }
+}
+
+/// Create the Motherlode ticket sale singleton (permissionless, once).
+pub fn init_tickets(payer: Pubkey) -> Instruction {
+    Instruction {
+        program_id: crate::id(),
+        accounts: vec![
+            AccountMeta::new(payer, true),
+            AccountMeta::new(pda::ticket_state_pda().0, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+        ],
+        data: vec![MinerInstruction::InitTickets as u8],
+    }
+}
+
+/// Buy Motherlode tickets. `lifetime` comes from the current
+/// TicketState (lifetime_tickets); a concurrent buy shifts the counter
+/// and makes this fail on the PDA check - re-read and retry.
+pub fn buy_tickets(
+    authority: Pubkey,
+    mint: Pubkey,
+    count: u64,
+    lifetime: u64,
+) -> Instruction {
+    let (config, _) = pda::config_pda();
+    let mut data = vec![MinerInstruction::BuyTickets as u8];
+    data.extend_from_slice(&count.to_le_bytes());
+    Instruction {
+        program_id: crate::id(),
+        accounts: vec![
+            AccountMeta::new(authority, true),
+            AccountMeta::new(pda::ticket_state_pda().0, false),
+            AccountMeta::new(pda::motherlode_pda().0, false),
+            AccountMeta::new_readonly(config, false),
+            AccountMeta::new(mint, false),
+            AccountMeta::new(pda::ata(&authority, &mint), false),
+            AccountMeta::new(pda::ticket_batch_pda(lifetime).0, false),
+            AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+        ],
+        data,
+    }
+}
+
+/// Settle pending ticket draws into the winner's Win PDA. The batch is
+/// any one covering a pending ticket index (scan the epoch's TicketBatch
+/// accounts client-side); every covered slot settles in one call.
+pub fn settle_ticket_win(
+    payer: Pubkey,
+    batch: Pubkey,
+    batch_wallet: Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: crate::id(),
+        accounts: vec![
+            AccountMeta::new(payer, true),
+            AccountMeta::new(pda::ticket_state_pda().0, false),
+            AccountMeta::new(pda::motherlode_pda().0, false),
+            AccountMeta::new(batch, false),
+            AccountMeta::new(batch_wallet, false),
+            AccountMeta::new(pda::win_pda(&batch_wallet).0, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+        ],
+        data: vec![MinerInstruction::SettleTicketWin as u8],
+    }
+}
+
+/// Garbage-collect a stale ticket batch (epoch over, draw settled); the
+/// rent goes back to the batch wallet regardless of who cranks this.
+pub fn close_ticket_batch(batch: Pubkey, batch_wallet: Pubkey) -> Instruction {
+    Instruction {
+        program_id: crate::id(),
+        accounts: vec![
+            AccountMeta::new_readonly(pda::ticket_state_pda().0, false),
+            AccountMeta::new(batch, false),
+            AccountMeta::new(batch_wallet, false),
+        ],
+        data: vec![MinerInstruction::CloseTicketBatch as u8],
     }
 }
 

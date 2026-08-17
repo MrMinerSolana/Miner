@@ -476,6 +476,8 @@ fn cmd_mine(ctx: &Ctx) {
 fn cmd_crank(ctx: &Ctx) {
     use std::time::{SystemTime, UNIX_EPOCH};
     println!("Crank bot (Ctrl+C to stop)");
+    // A pending ticket draw may have been left over from before a restart.
+    service_tickets(ctx);
     loop {
         let config = ctx.config();
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
@@ -507,7 +509,12 @@ fn cmd_crank(ctx: &Ctx) {
             }
         }
         match ctx.send(&ixs, &[]) {
-            Ok(()) => println!("round #{next} opened"),
+            Ok(()) => {
+                println!("round #{next} opened");
+                // A strike may have handed winner slots to tickets; deliver
+                // those shares and sweep expired batches while we're at it.
+                service_tickets(ctx);
+            }
             Err(e) if e.contains("0x6") => sleep(Duration::from_secs(1)), /* round still open */
             Err(e) => {
                 println!("  crank error: {}", short_err(&e));
@@ -515,6 +522,83 @@ fn cmd_crank(ctx: &Ctx) {
             }
         }
     }
+}
+
+/// Ticket housekeeping after a crank: delivery only, zero discretion.
+/// The draw itself already happened on-chain inside the crank instruction
+/// (pending_shares/pending_tickets on the TicketState, entropy from slot
+/// hashes); this merely submits the batch covering each drawn index, and
+/// the program re-verifies the coverage on-chain - passing any other
+/// batch fails. Both SettleTicketWin and CloseTicketBatch are
+/// permissionless, and batch rent always returns to the buyer.
+fn service_tickets(ctx: &Ctx) {
+    let Some(tickets) = ctx.read::<TicketState>(&pda::ticket_state_pda().0) else {
+        return; // feature not initialized on this cluster
+    };
+    let has_pending = tickets.pending_shares.iter().any(|&s| s > 0);
+    // Batches only ever exist between a buy and the post-draw sweep, so an
+    // empty result is the common case and the filtered scan stays cheap.
+    let batches = match fetch_ticket_batches(ctx) {
+        Ok(b) => b,
+        Err(e) => {
+            println!("  ticket scan error: {}", short_err(&e));
+            return;
+        }
+    };
+    for (key, batch) in &batches {
+        let covers_pending = has_pending
+            && batch.epoch == tickets.pending_epoch
+            && (0..MOTHERLODE_WINNERS).any(|slot| {
+                tickets.pending_shares[slot] > 0
+                    && tickets.pending_tickets[slot] >= batch.start
+                    && tickets.pending_tickets[slot] < batch.start + batch.count
+            });
+        let wallet = Pubkey::new_from_array(batch.wallet);
+        if covers_pending {
+            match ctx.send(&[sdk::settle_ticket_win(ctx.payer.pubkey(), *key, wallet)], &[]) {
+                Ok(()) => println!("  ticket win settled to {wallet}"),
+                // Lost the race to another cranker: the win is delivered
+                // either way, nothing to retry.
+                Err(e) => println!("  ticket settle error: {}", short_err(&e)),
+            }
+        } else if batch.epoch < tickets.epoch
+            && !(has_pending && batch.epoch == tickets.pending_epoch)
+        {
+            // Expired epoch, draw fully settled: rent back to the buyer.
+            if let Err(e) = ctx.send(&[sdk::close_ticket_batch(*key, wallet)], &[]) {
+                println!("  ticket GC error: {}", short_err(&e));
+            }
+        }
+    }
+}
+
+/// All live TicketBatch accounts (dataSize + discriminator filtered).
+fn fetch_ticket_batches(ctx: &Ctx) -> Result<Vec<(Pubkey, TicketBatch)>, String> {
+    use solana_rpc_client_api::{
+        config::RpcProgramAccountsConfig,
+        filter::{Memcmp, RpcFilterType},
+    };
+    let config = RpcProgramAccountsConfig {
+        filters: Some(vec![
+            RpcFilterType::DataSize(TicketBatch::SIZE as u64),
+            RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
+                0,
+                TICKET_BATCH_DISCRIMINATOR.to_le_bytes().to_vec(),
+            )),
+        ]),
+        ..Default::default()
+    };
+    Ok(ctx
+        .rpc
+        .get_program_ui_accounts_with_config(&miner_api::id(), config)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter_map(|(key, ui)| {
+            let data = ui.data.decode()?;
+            (data.len() == TicketBatch::SIZE)
+                .then(|| (key, bytemuck::pod_read_unaligned::<TicketBatch>(&data)))
+        })
+        .collect())
 }
 
 fn cmd_claim(ctx: &Ctx) {

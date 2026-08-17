@@ -42,6 +42,20 @@ pub fn win_pda(authority: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[WIN_SEED, authority.as_ref()], &crate::id())
 }
 
+pub fn ticket_state_pda() -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[TICKET_STATE_SEED], &crate::id())
+}
+
+/// One purchase = one batch, keyed by the lifetime ticket counter at the
+/// time of the buy: it never resets, so the address is globally unique
+/// forever (a stale, never-collected batch can't block a future buy).
+pub fn ticket_batch_pda(lifetime: u64) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[TICKET_BATCH_SEED, &lifetime.to_le_bytes()],
+        &crate::id(),
+    )
+}
+
 pub fn game_pda() -> (Pubkey, u8) {
     Pubkey::find_program_address(&[GAME_SEED], &crate::id())
 }

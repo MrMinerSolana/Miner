@@ -282,6 +282,48 @@ fn rig_draw(svm: &mut LiteSVM, hit: bool) {
     }
 }
 
+/// Like rig_draw(hit), but additionally grinds the per-slot draws: with
+/// `tickets` tickets participating (chances = hashes + tickets), slot s
+/// must land on a ticket iff want_ticket[s]. Reproduces the exact strike
+/// hash the crank will compute, so the test controls which winner slots
+/// go to the mining candidates and which go to the ticket draw.
+fn rig_ticket_draw(
+    svm: &mut LiteSVM,
+    tickets: u64,
+    want_ticket: [bool; MOTHERLODE_WINNERS],
+) {
+    let config = get_config(svm);
+    let ml = get_motherlode(svm);
+    let chances = ml.hashes + tickets;
+    let slot: u64 = 1;
+    loop {
+        let hash = Hash::new_unique();
+        let mut entropy = [0u8; 40];
+        entropy[..8].copy_from_slice(&slot.to_le_bytes());
+        entropy[8..].copy_from_slice(hash.as_ref());
+        let strike = solana_sdk::keccak::hashv(&[
+            entropy.as_slice(),
+            &config.current_round.to_le_bytes(),
+            &ml.hashes.to_le_bytes(),
+        ]);
+        let roll = u64::from_le_bytes(strike.as_ref()[..8].try_into().unwrap());
+        if roll % MOTHERLODE_ODDS != 0 {
+            continue;
+        }
+        let ok = (0..MOTHERLODE_WINNERS).all(|s| {
+            let off = 8 + 8 * s;
+            let draw = u64::from_le_bytes(
+                strike.as_ref()[off..off + 8].try_into().unwrap(),
+            ) % chances;
+            (draw >= ml.hashes) == want_ticket[s]
+        });
+        if ok {
+            svm.set_sysvar::<SlotHashes>(&SlotHashes::new(&[(slot, hash)]));
+            return;
+        }
+    }
+}
+
 // ---------- tests ----------
 
 #[test]
@@ -1874,6 +1916,445 @@ fn test_motherlode_win_accumulates_and_draws_continue() {
     );
     let err = send(&mut svm, &[ix], &bob, &[]).expect_err("foreign claim must fail");
     assert!(err.contains("Custom(3)"), "expected Unauthorized: {err}");
+}
+
+// ---------- Motherlode tickets ----------
+
+fn get_tickets(svm: &LiteSVM) -> TicketState {
+    get_state(svm, &pda::ticket_state_pda().0)
+}
+
+fn get_batch(svm: &LiteSVM, batch: &Pubkey) -> TicketBatch {
+    get_state(svm, batch)
+}
+
+/// Inits the ticket singleton and gives the mint real supply on the books
+/// (BuyTickets burns from the buyer's ATA, and SPL burn decrements the
+/// supply counter, which setup() leaves at zero).
+fn setup_tickets(svm: &mut LiteSVM, admin: &Keypair, mint: &Pubkey) {
+    send(svm, &[sdk::init_tickets(admin.pubkey())], admin, &[]).expect("init_tickets");
+    let (treasury, _) = pda::treasury_pda();
+    svm.set_account(*mint, mint_account(&treasury, 1_000_000 * ONE_TOKEN))
+        .unwrap();
+}
+
+/// Buys tickets at the current lifetime counter, returns the batch PDA.
+fn buy_tickets(
+    svm: &mut LiteSVM,
+    buyer: &Keypair,
+    mint: &Pubkey,
+    count: u64,
+) -> Pubkey {
+    let ts = get_tickets(svm);
+    send(
+        svm,
+        &[sdk::buy_tickets(
+            buyer.pubkey(),
+            *mint,
+            count,
+            ts.lifetime_tickets,
+        )],
+        buyer,
+        &[],
+    )
+    .expect("buy_tickets");
+    pda::ticket_batch_pda(ts.lifetime_tickets).0
+}
+
+#[test]
+fn test_buy_tickets_burns_and_stacks_pot() {
+    let (mut svm, admin, mint) = setup();
+    setup_tickets(&mut svm, &admin, &mint);
+
+    // Any wallet can buy - no miner registration needed.
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    svm.airdrop(&alice.pubkey(), 1_000_000_000).unwrap();
+    svm.airdrop(&bob.pubkey(), 1_000_000_000).unwrap();
+    set_balance(&mut svm, &mint, &alice.pubkey(), 10 * ONE_TOKEN);
+    set_balance(&mut svm, &mint, &bob.pubkey(), 10 * ONE_TOKEN);
+
+    // Zero tickets is rejected.
+    let err = send(
+        &mut svm,
+        &[sdk::buy_tickets(alice.pubkey(), mint, 0, 0)],
+        &alice,
+        &[],
+    )
+    .expect_err("zero tickets must fail");
+    assert!(err.contains("Custom(26)"), "expected InvalidTicketCount: {err}");
+
+    // Alice buys 3: the payment moves into the pot (the tokens burn and
+    // the pot mints back at claim), and the batch covers tickets [0, 3).
+    let supply_before = mint_supply(&svm, &mint);
+    let pot_before = get_motherlode(&svm).pot;
+    let alice_batch = buy_tickets(&mut svm, &alice, &mint, 3);
+    assert_eq!(token_balance(&svm, &mint, &alice.pubkey()), 7 * ONE_TOKEN);
+    assert_eq!(mint_supply(&svm, &mint), supply_before - 3 * TICKET_PRICE);
+    assert_eq!(get_motherlode(&svm).pot, pot_before + 3 * TICKET_PRICE);
+    let ts = get_tickets(&svm);
+    assert_eq!(ts.total_tickets, 3);
+    assert_eq!(ts.lifetime_tickets, 3);
+    assert_eq!(ts.epoch, 0);
+    let batch = get_batch(&svm, &alice_batch);
+    assert_eq!(batch.wallet, alice.pubkey().to_bytes());
+    assert_eq!((batch.epoch, batch.start, batch.count), (0, 0, 3));
+
+    // Bob's batch starts where alice's ended.
+    let bob_batch = buy_tickets(&mut svm, &bob, &mint, 2);
+    assert_eq!(get_tickets(&svm).total_tickets, 5);
+    let batch = get_batch(&svm, &bob_batch);
+    assert_eq!(batch.wallet, bob.pubkey().to_bytes());
+    assert_eq!((batch.start, batch.count), (3, 2));
+
+    // A stale lifetime counter (someone bought in between) fails on the
+    // PDA check.
+    let err = send(
+        &mut svm,
+        &[sdk::buy_tickets(alice.pubkey(), mint, 1, 3)],
+        &alice,
+        &[],
+    )
+    .expect_err("stale counter must fail");
+    assert!(err.contains("Custom(1)"), "expected InvalidAccount: {err}");
+
+    // A balance short of the cost is rejected before the burn CPI.
+    let err = send(
+        &mut svm,
+        &[sdk::buy_tickets(alice.pubkey(), mint, 1_000, 5)],
+        &alice,
+        &[],
+    )
+    .expect_err("unaffordable buy must fail");
+    assert!(err.contains("Custom(9)"), "expected InvalidTokenAccount: {err}");
+}
+
+#[test]
+fn test_ticket_strike_slots_drawn_to_tickets_and_settle() {
+    let (mut svm, admin, mint) = setup();
+    setup_tickets(&mut svm, &admin, &mint);
+    let alice = Keypair::new();
+    register_miner(&mut svm, &alice);
+    set_balance(&mut svm, &mint, &alice.pubkey(), 0);
+
+    // Two ticket buyers, neither of them mines.
+    let bob = Keypair::new();
+    let carol = Keypair::new();
+    svm.airdrop(&bob.pubkey(), 1_000_000_000).unwrap();
+    svm.airdrop(&carol.pubkey(), 1_000_000_000).unwrap();
+    set_balance(&mut svm, &mint, &bob.pubkey(), 10 * ONE_TOKEN);
+    set_balance(&mut svm, &mint, &carol.pubkey(), 10 * ONE_TOKEN);
+    let bob_batch = buy_tickets(&mut svm, &bob, &mint, 4); // tickets 0..4
+    let carol_batch = buy_tickets(&mut svm, &carol, &mint, 2); // tickets 4..6
+
+    // Mined round + rigged hit where every winner slot lands on a ticket
+    // (1 hash + 6 tickets = 7 chances per slot). The pot still splits the
+    // classic MOTHERLODE_WINNERS ways; all shares go pending and alice,
+    // despite holding every candidate slot, gets nothing.
+    let tithe = motherlode_tithe(DEFAULT_BUDGET);
+    mine(&mut svm, &alice, &mint).expect("mine round 0");
+    rig_ticket_draw(&mut svm, 6, [true; MOTHERLODE_WINNERS]);
+    advance_round(&mut svm, &admin);
+
+    let pot = tithe + 6 * TICKET_PRICE;
+    let share = pot / MOTHERLODE_WINNERS as u64;
+    let ml = get_motherlode(&svm);
+    assert_eq!(ml.pot, 0);
+    assert_eq!(ml.last_win_amount, share);
+    // Ticket-won slots stay zeroed in last_winners.
+    assert_eq!(ml.last_winners, [[0u8; 32]; MOTHERLODE_WINNERS]);
+    assert!(account_closed(&svm, &pda::win_pda(&alice.pubkey()).0));
+
+    let ts = get_tickets(&svm);
+    assert_eq!(ts.pending_epoch, 0);
+    assert_eq!(ts.epoch, 1);
+    assert_eq!(ts.total_tickets, 0);
+    assert_eq!(ts.pending_shares.iter().sum::<u64>(), pot);
+    assert!(ts.pending_tickets.iter().all(|&t| t < 6));
+
+    // Expected payout per buyer: the sum of the shares whose drawn ticket
+    // index falls into their batch.
+    let mut expect_bob = 0u64;
+    let mut expect_carol = 0u64;
+    for slot in 0..MOTHERLODE_WINNERS {
+        if ts.pending_tickets[slot] < 4 {
+            expect_bob += ts.pending_shares[slot];
+        } else {
+            expect_carol += ts.pending_shares[slot];
+        }
+    }
+    assert_eq!(expect_bob + expect_carol, pot);
+
+    // Settling a batch pays out every pending slot it covers in one go
+    // and closes the batch (rent to the buyer); a batch covering nothing
+    // is rejected.
+    for (wallet, batch, expect) in [
+        (bob.pubkey(), bob_batch, expect_bob),
+        (carol.pubkey(), carol_batch, expect_carol),
+    ] {
+        svm.expire_blockhash();
+        if expect == 0 {
+            let err = send(
+                &mut svm,
+                &[sdk::settle_ticket_win(admin.pubkey(), batch, wallet)],
+                &admin,
+                &[],
+            )
+            .expect_err("settle with a non-covering batch must fail");
+            assert!(
+                err.contains("Custom(27)"),
+                "expected NoPendingTicketWin: {err}"
+            );
+            continue;
+        }
+        let wallet_before = svm.get_balance(&wallet).unwrap();
+        let batch_rent = svm.get_account(&batch).unwrap().lamports;
+        send(
+            &mut svm,
+            &[sdk::settle_ticket_win(admin.pubkey(), batch, wallet)],
+            &admin,
+            &[],
+        )
+        .expect("settle ticket win");
+        let win = get_win(&svm, &wallet);
+        assert_eq!(win.authority, wallet.to_bytes());
+        assert_eq!(win.amount, expect);
+        assert!(account_closed(&svm, &batch));
+        assert_eq!(
+            svm.get_balance(&wallet).unwrap(),
+            wallet_before + batch_rent
+        );
+    }
+    assert!(get_tickets(&svm).pending_shares.iter().all(|&s| s == 0));
+
+    // Settling backfilled each ticket-won slot with the buyer's wallet,
+    // so the strike record reads like a mining win.
+    let ml = get_motherlode(&svm);
+    for slot in 0..MOTHERLODE_WINNERS {
+        let expect = if ts.pending_tickets[slot] < 4 {
+            bob.pubkey()
+        } else {
+            carol.pubkey()
+        };
+        assert_eq!(ml.last_winners[slot], expect.to_bytes());
+    }
+
+    // The win claims exactly like a mining strike win: 80% to the wallet,
+    // 20% minted to the treasury ATA and burned in the same instruction.
+    let (treasury, _) = pda::treasury_pda();
+    svm.set_account(
+        pda::ata(&treasury, &mint),
+        token_account(&mint, &treasury, 0),
+    )
+    .unwrap();
+    let (winner, winner_kp, expect) = if expect_bob > 0 {
+        (bob.pubkey(), &bob, expect_bob)
+    } else {
+        (carol.pubkey(), &carol, expect_carol)
+    };
+    let balance_before = token_balance(&svm, &mint, &winner);
+    let expected_burn = expect * MOTHERLODE_BURN_BPS / BPS_DENOM;
+    send(
+        &mut svm,
+        &[sdk::claim_motherlode(winner, mint)],
+        winner_kp,
+        &[],
+    )
+    .expect("claim ticket win");
+    assert_eq!(
+        token_balance(&svm, &mint, &winner),
+        balance_before + expect - expected_burn
+    );
+}
+
+#[test]
+fn test_ticket_draw_skipped_while_pending_and_rolls_over() {
+    let (mut svm, admin, mint) = setup();
+    setup_tickets(&mut svm, &admin, &mint);
+    let alice = Keypair::new();
+    register_miner(&mut svm, &alice);
+    set_balance(&mut svm, &mint, &alice.pubkey(), 0);
+    let bob = Keypair::new();
+    svm.airdrop(&bob.pubkey(), 1_000_000_000).unwrap();
+    set_balance(&mut svm, &mint, &bob.pubkey(), 10 * ONE_TOKEN);
+
+    // Strike 1 with every slot drawn to tickets: all shares go pending.
+    let bob_batch1 = buy_tickets(&mut svm, &bob, &mint, 2);
+    mine(&mut svm, &alice, &mint).expect("mine round 0");
+    rig_ticket_draw(&mut svm, 2, [true; MOTHERLODE_WINNERS]);
+    advance_round(&mut svm, &admin);
+    let ts = get_tickets(&svm);
+    let pot1 = motherlode_tithe(DEFAULT_BUDGET) + 2 * TICKET_PRICE;
+    assert_eq!(ts.pending_shares.iter().sum::<u64>(), pot1);
+    let pending_before = ts.pending_shares;
+    assert_eq!(ts.epoch, 1);
+
+    // Epoch 1 sales while the draws are still unsettled.
+    let bob_batch2 = buy_tickets(&mut svm, &bob, &mint, 3);
+
+    // Strike 2 before the settle: ticket participation is skipped (a
+    // pending winner is never overwritten), the pot pays the mining
+    // candidates and the epoch's tickets roll over untouched.
+    mine(&mut svm, &alice, &mint).expect("mine round 1");
+    rig_draw(&mut svm, true);
+    advance_round(&mut svm, &admin);
+    let ts = get_tickets(&svm);
+    assert_eq!(ts.pending_shares, pending_before);
+    assert_eq!(ts.pending_epoch, 0);
+    assert_eq!(ts.epoch, 1);
+    assert_eq!(ts.total_tickets, 3);
+    // Alice (all candidate slots) took the whole second pot.
+    let pot2 = motherlode_tithe(DEFAULT_BUDGET) + 3 * TICKET_PRICE;
+    assert_eq!(get_win(&svm, &alice.pubkey()).amount, pot2);
+    assert_eq!(
+        get_motherlode(&svm).last_win_amount,
+        pot2 / MOTHERLODE_WINNERS as u64
+    );
+
+    // Settle the epoch-0 draws (bob's batch covers them all); the next
+    // hit then draws the epoch-1 tickets again.
+    send(
+        &mut svm,
+        &[sdk::settle_ticket_win(admin.pubkey(), bob_batch1, bob.pubkey())],
+        &admin,
+        &[],
+    )
+    .expect("settle epoch 0");
+    assert_eq!(get_win(&svm, &bob.pubkey()).amount, pot1);
+    // Strike 2 (hash-only) overwrote the record; the late settle must not
+    // corrupt it with the epoch-0 ticket winner.
+    assert_eq!(
+        get_motherlode(&svm).last_winners,
+        [alice.pubkey().to_bytes(); MOTHERLODE_WINNERS]
+    );
+
+    // Strike 3, mixed draw: slot 1 lands on a ticket, slots 0 and 2 stay
+    // with the mining candidate (alice).
+    mine(&mut svm, &alice, &mint).expect("mine round 2");
+    let mut want = [false; MOTHERLODE_WINNERS];
+    want[1] = true;
+    rig_ticket_draw(&mut svm, 3, want);
+    advance_round(&mut svm, &admin);
+    let ts = get_tickets(&svm);
+    let pot3 = motherlode_tithe(DEFAULT_BUDGET);
+    let share3 = pot3 / MOTHERLODE_WINNERS as u64;
+    let remainder3 = pot3 - share3 * MOTHERLODE_WINNERS as u64;
+    assert_eq!(ts.pending_epoch, 1);
+    assert_eq!(ts.pending_shares, [0, share3, 0]);
+    assert!(ts.pending_tickets[1] < 3);
+    assert_eq!(ts.epoch, 2);
+    assert_eq!(ts.total_tickets, 0);
+    // Alice took slots 0 (with the remainder) and 2 on top of pot2.
+    assert_eq!(
+        get_win(&svm, &alice.pubkey()).amount,
+        pot2 + share3 + remainder3 + share3
+    );
+    let ml = get_motherlode(&svm);
+    assert_eq!(ml.last_winners[0], alice.pubkey().to_bytes());
+    assert_eq!(ml.last_winners[1], [0u8; 32]);
+    assert_eq!(ml.last_winners[2], alice.pubkey().to_bytes());
+
+    // Settling the epoch-1 batch backfills the ticket-won slot with bob
+    // while alice's hash-won slots stay untouched.
+    svm.expire_blockhash();
+    send(
+        &mut svm,
+        &[sdk::settle_ticket_win(admin.pubkey(), bob_batch2, bob.pubkey())],
+        &admin,
+        &[],
+    )
+    .expect("settle epoch 1");
+    let ml = get_motherlode(&svm);
+    assert_eq!(ml.last_winners[0], alice.pubkey().to_bytes());
+    assert_eq!(ml.last_winners[1], bob.pubkey().to_bytes());
+    assert_eq!(ml.last_winners[2], alice.pubkey().to_bytes());
+}
+
+#[test]
+fn test_close_ticket_batch_gc() {
+    let (mut svm, admin, mint) = setup();
+    setup_tickets(&mut svm, &admin, &mint);
+    let alice = Keypair::new();
+    register_miner(&mut svm, &alice);
+    set_balance(&mut svm, &mint, &alice.pubkey(), 0);
+    let bob = Keypair::new();
+    let carol = Keypair::new();
+    svm.airdrop(&bob.pubkey(), 1_000_000_000).unwrap();
+    svm.airdrop(&carol.pubkey(), 1_000_000_000).unwrap();
+    set_balance(&mut svm, &mint, &bob.pubkey(), 10 * ONE_TOKEN);
+    set_balance(&mut svm, &mint, &carol.pubkey(), 10 * ONE_TOKEN);
+
+    let bob_batch = buy_tickets(&mut svm, &bob, &mint, 4); // 0..4
+    let carol_batch = buy_tickets(&mut svm, &carol, &mint, 2); // 4..6
+
+    // A live epoch's batch cannot be closed.
+    let err = send(
+        &mut svm,
+        &[sdk::close_ticket_batch(bob_batch, bob.pubkey())],
+        &admin,
+        &[],
+    )
+    .expect_err("closing a live batch must fail");
+    assert!(err.contains("Custom(28)"), "expected TicketBatchActive: {err}");
+
+    // Strike with exactly one slot drawn to a ticket: the epoch is over
+    // but a draw is pending - still no GC, the winning batch must survive
+    // until SettleTicketWin.
+    mine(&mut svm, &alice, &mint).expect("mine round 0");
+    let mut want = [false; MOTHERLODE_WINNERS];
+    want[0] = true;
+    rig_ticket_draw(&mut svm, 6, want);
+    advance_round(&mut svm, &admin);
+    let err = send(
+        &mut svm,
+        &[sdk::close_ticket_batch(bob_batch, bob.pubkey())],
+        &admin,
+        &[],
+    )
+    .expect_err("closing while the draw is pending must fail");
+    assert!(err.contains("Custom(28)"), "expected TicketBatchActive: {err}");
+
+    // Settle, then the losing batch is garbage-collectable by anyone and
+    // the rent goes to the buyer, not the caller.
+    let ts = get_tickets(&svm);
+    let (win_batch, winner, lose_batch, loser) = if ts.pending_tickets[0] < 4 {
+        (bob_batch, bob.pubkey(), carol_batch, carol.pubkey())
+    } else {
+        (carol_batch, carol.pubkey(), bob_batch, bob.pubkey())
+    };
+    send(
+        &mut svm,
+        &[sdk::settle_ticket_win(admin.pubkey(), win_batch, winner)],
+        &admin,
+        &[],
+    )
+    .expect("settle");
+
+    // The rent must go to the batch wallet: a mismatched wallet account
+    // is rejected.
+    let err = send(
+        &mut svm,
+        &[sdk::close_ticket_batch(lose_batch, admin.pubkey())],
+        &admin,
+        &[],
+    )
+    .expect_err("wrong wallet must fail");
+    assert!(err.contains("Custom(1)"), "expected InvalidAccount: {err}");
+
+    let loser_before = svm.get_balance(&loser).unwrap();
+    let batch_rent = svm.get_account(&lose_batch).unwrap().lamports;
+    // Fresh blockhash: the GC retry can be byte-identical to an earlier
+    // rejected attempt and LiteSVM would dedup it.
+    svm.expire_blockhash();
+    send(
+        &mut svm,
+        &[sdk::close_ticket_batch(lose_batch, loser)],
+        &admin,
+        &[],
+    )
+    .expect("gc the losing batch");
+    assert!(account_closed(&svm, &lose_batch));
+    assert_eq!(svm.get_balance(&loser).unwrap(), loser_before + batch_rent);
 }
 
 // ---------- Tunnels (game) ----------

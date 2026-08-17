@@ -22,5 +22,6 @@ miner-api = { workspace = true }
 bytemuck = { workspace = true }
 solana-sdk = "4"
 solana-rpc-client = "4"
+solana-rpc-client-api = "4"
 solana-commitment-config = "3"
 solana-system-interface = { version = "3", features = ["bincode"] }

@@ -2005,6 +2005,7 @@ dependencies = [
  "miner-api",
  "solana-commitment-config",
  "solana-rpc-client",
+ "solana-rpc-client-api",
  "solana-sdk",
  "solana-system-interface 3.2.0",
 ]

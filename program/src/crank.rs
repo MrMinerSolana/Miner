@@ -21,11 +21,23 @@ use crate::loaders::*;
 /// account) and the pot restarts; later strikes are never paused by
 /// unclaimed wins.
 pub fn process(accounts: &[AccountInfo]) -> ProgramResult {
-    // 7 fixed accounts + one Win PDA per candidate slot, in slot order.
-    if accounts.len() != 7 + MOTHERLODE_WINNERS {
+    // 7 fixed accounts + one Win PDA per candidate slot (slot order) + an
+    // optional trailing TicketState. With the ticket account a strike
+    // draws each of the MOTHERLODE_WINNERS slots from hashes + tickets
+    // chances: mined hashes keep their usual odds and every sold ticket
+    // is one extra chance. A slot that lands on a ticket has its share
+    // reserved on the TicketState (delivered by SettleTicketWin); the
+    // draw consumes the epoch's tickets either way. Without the account
+    // - or with no tickets sold, or with a previous draw still unsettled
+    // - the split works exactly as before tickets existed.
+    if accounts.len() < 7 + MOTHERLODE_WINNERS
+        || accounts.len() > 7 + MOTHERLODE_WINNERS + 1
+    {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
-    let (fixed_accounts, win_infos) = accounts.split_at(7);
+    let (fixed_accounts, rest) = accounts.split_at(7);
+    let (win_infos, ticket_rest) = rest.split_at(MOTHERLODE_WINNERS);
+    let ticket_state_info = ticket_rest.first();
     let [payer_info, config_info, new_round_info, system_program, closing_round_info, motherlode_info, slot_hashes_info] =
         fixed_accounts
     else {
@@ -86,13 +98,60 @@ pub fn process(accounts: &[AccountInfo]) -> ProgramResult {
         ]);
         let roll = u64::from_le_bytes(strike.as_ref()[..8].try_into().unwrap());
         if roll % MOTHERLODE_ODDS == 0 {
+            // Tickets join the draw only when the account was passed,
+            // any were sold this epoch, and no earlier draw is still
+            // pending (a pending winner is never overwritten; that strike
+            // simply pays the mining candidates and tickets roll over).
+            let mut tickets: Option<TicketState> = None;
+            if let Some(info) = ticket_state_info {
+                // Tolerated as a no-op before InitTickets ever ran (the
+                // singleton does not exist yet), so the program upgrade
+                // and the crank client can roll out in any order.
+                if info.owner.eq(&miner_api::id())
+                    && info.data_len() == TicketState::SIZE
+                {
+                    expect_writable(info)?;
+                    expect_program_account(info, TICKET_STATE_DISCRIMINATOR)?;
+                    let ts = read_state::<TicketState>(info)?;
+                    if ts.total_tickets > 0
+                        && ts.pending_shares.iter().all(|&s| s == 0)
+                    {
+                        tickets = Some(ts);
+                    }
+                }
+            }
+            let ticket_count = tickets.as_ref().map_or(0, |ts| ts.total_tickets);
+            // Every mined hash and every ticket is one chance; each of
+            // the MOTHERLODE_WINNERS slots draws independently from the
+            // combined pool (hashes > 0 is guaranteed by the outer if).
+            let chances = motherlode
+                .hashes
+                .checked_add(ticket_count)
+                .ok_or(MinerError::Overflow)?;
             // Even split; the division remainder (dust of at most
             // MOTHERLODE_WINNERS - 1 native units) goes to the first slot.
-            let share = motherlode.pot / (MOTHERLODE_WINNERS as u64);
-            let remainder = motherlode.pot - share * (MOTHERLODE_WINNERS as u64);
+            let share = motherlode.pot / MOTHERLODE_WINNERS as u64;
+            let remainder = motherlode.pot - share * MOTHERLODE_WINNERS as u64;
+            let mut last_winners = [[0u8; 32]; MOTHERLODE_WINNERS];
             for slot in 0..MOTHERLODE_WINNERS {
                 let amount = if slot == 0 { share + remainder } else { share };
                 if amount == 0 {
+                    continue;
+                }
+                // Per-slot draw from the strike hash (bytes 8.., disjoint
+                // from the roll in bytes 0..8).
+                let off = 8 + 8 * slot;
+                let draw = u64::from_le_bytes(
+                    strike.as_ref()[off..off + 8].try_into().unwrap(),
+                ) % chances;
+                if draw >= motherlode.hashes {
+                    // The slot lands on a ticket: reserve the share for
+                    // SettleTicketWin (the buyer is unknown on-chain here;
+                    // the batch covering the index delivers it). Unwrap is
+                    // safe: draw >= hashes implies ticket_count > 0.
+                    let ts = tickets.as_mut().unwrap();
+                    ts.pending_shares[slot] = amount;
+                    ts.pending_tickets[slot] = draw - motherlode.hashes;
                     continue;
                 }
                 let win_info = &win_infos[slot];
@@ -101,6 +160,7 @@ pub fn process(accounts: &[AccountInfo]) -> ProgramResult {
                 let (win_key, win_bump) = pda::win_pda(&candidate);
                 expect_key(win_info, &win_key)?;
                 expect_writable(win_info)?;
+                last_winners[slot] = candidate_bytes;
                 // A wallet holding several slots appears here several
                 // times: the first pass creates its Win, the later ones
                 // fall into the accumulate branch (the AccountInfos alias
@@ -135,7 +195,21 @@ pub fn process(accounts: &[AccountInfo]) -> ProgramResult {
                     write_state(win_info, &win)?;
                 }
             }
-            motherlode.last_winners = motherlode.candidates;
+            // The draw consumed the epoch's tickets (won or not): sales
+            // restart at zero and stale batches become garbage-collectable
+            // once any pending draws settle.
+            if let Some(mut ts) = tickets {
+                if ts.pending_shares.iter().any(|&s| s > 0) {
+                    ts.pending_epoch = ts.epoch;
+                }
+                ts.epoch = ts.epoch.checked_add(1).ok_or(MinerError::Overflow)?;
+                ts.total_tickets = 0;
+                // Unwrap is safe: tickets is only Some when the info was.
+                write_state(ticket_state_info.unwrap(), &ts)?;
+            }
+            // Ticket-won slots stay zeroed in last_winners (the wallet is
+            // only known at settle time).
+            motherlode.last_winners = last_winners;
             motherlode.last_win_amount = share;
             motherlode.last_win_ts = now;
             motherlode.pot = 0;

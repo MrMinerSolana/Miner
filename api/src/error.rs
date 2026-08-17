@@ -59,6 +59,13 @@ pub enum MinerError {
     InvalidStake = 24,
     /// The pool account does not carry a readable spot price.
     InvalidPool = 25,
+    /// Buying zero tickets (or the batch would overflow the epoch counter).
+    InvalidTicketCount = 26,
+    /// The ticket batch does not cover the pending draw / no draw pending.
+    NoPendingTicketWin = 27,
+    /// The batch's epoch is still running (or its draw is unsettled):
+    /// closing it now could destroy a live or winning ticket.
+    TicketBatchActive = 28,
 }
 
 impl From<MinerError> for ProgramError {

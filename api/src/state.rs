@@ -15,6 +15,8 @@ pub const GAME_DISCRIMINATOR: u64 = 9;
 pub const GAME_ROUND_DISCRIMINATOR: u64 = 10;
 pub const GAME_ENTRY_DISCRIMINATOR: u64 = 11;
 pub const GAME_WIN_DISCRIMINATOR: u64 = 12;
+pub const TICKET_STATE_DISCRIMINATOR: u64 = 13;
+pub const TICKET_BATCH_DISCRIMINATOR: u64 = 14;
 
 /// Global program configuration ("config" PDA, singleton).
 #[repr(C)]
@@ -329,8 +331,68 @@ pub struct GameWin {
     pub bump: u64,
 }
 
+/// Motherlode ticket sale state ("tickets" PDA, singleton created by
+/// InitTickets). A ticket costs TICKET_PRICE $MINER and the full price is
+/// credited to the Motherlode pot; tickets stay in play for the whole
+/// epoch, from one strike to the next. At a strike the pot still splits
+/// across the MOTHERLODE_WINNERS slots, but each slot is drawn from
+/// hashes + tickets chances: mined hashes keep their odds and every
+/// ticket is one extra chance. A slot that lands on a ticket has its
+/// share reserved here (pending_*) and SettleTicketWin delivers it to
+/// the wallet whose TicketBatch covers the drawn index. The draw (win or
+/// not) consumes the epoch's tickets.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct TicketState {
+    pub discriminator: u64,
+    /// Current sale epoch; bumped on every strike whose draw consumed the
+    /// tickets.
+    pub epoch: u64,
+    /// Tickets sold in the current epoch (also the next batch's start).
+    pub total_tickets: u64,
+    /// Epoch the pending draws belong to.
+    pub pending_epoch: u64,
+    /// Reserved share per winner slot, waiting for SettleTicketWin
+    /// (0 = that slot went to a mining candidate / already settled).
+    /// Strikes that land while any share is still pending skip the
+    /// ticket participation entirely, so a pending winner is never
+    /// overwritten and tickets roll over to the next strike.
+    pub pending_shares: [u64; MOTHERLODE_WINNERS],
+    /// The drawn ticket index per winner slot (within pending_epoch).
+    pub pending_tickets: [u64; MOTHERLODE_WINNERS],
+    /// Lifetime tickets sold (UI stat).
+    pub lifetime_tickets: u64,
+    /// PDA bump.
+    pub bump: u64,
+}
+
+/// One ticket purchase ("ticket_batch" PDA + epoch + start): the buyer
+/// owns tickets [start, start + count) of that epoch. Closable by anyone
+/// once the epoch is over (rent back to the buyer); the batch covering a
+/// pending draw is protected until it is settled.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct TicketBatch {
+    pub discriminator: u64,
+    /// The buyer (matches Miner.authority for miners, but any wallet may
+    /// buy tickets).
+    pub wallet: [u8; 32],
+    pub epoch: u64,
+    /// First ticket index of this batch within the epoch.
+    pub start: u64,
+    pub count: u64,
+    /// PDA bump.
+    pub bump: u64,
+}
+
 impl Config {
     pub const SIZE: usize = core::mem::size_of::<Config>();
+}
+impl TicketState {
+    pub const SIZE: usize = core::mem::size_of::<TicketState>();
+}
+impl TicketBatch {
+    pub const SIZE: usize = core::mem::size_of::<TicketBatch>();
 }
 impl Game {
     pub const SIZE: usize = core::mem::size_of::<Game>();

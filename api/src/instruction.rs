@@ -188,6 +188,41 @@ pub enum MinerInstruction {
     /// Accounts: [signer (FEE_WALLET or config.admin), recipient
     ///           (writable), config, game, game_round (writable)]
     GameCloseRound = 20,
+
+    /// Create the Motherlode ticket sale singleton PDA (permissionless,
+    /// once; payer covers the rent). Zero state: sales start in epoch 0.
+    /// Accounts: [payer (signer), ticket_state (PDA), system_program]
+    InitTickets = 21,
+
+    /// Buy Motherlode tickets: burns count * TICKET_PRICE $MINER from the
+    /// buyer (a real, visible SPL Burn), credits the same amount to the
+    /// Motherlode pot and records the purchase as a TicketBatch PDA
+    /// covering tickets [start, start + count) of the current epoch.
+    /// Tickets stay valid until the next strike that runs the ticket draw
+    /// (see Crank). Must be signed by the wallet itself.
+    /// Accounts: [authority (signer, payer), ticket_state (PDA),
+    ///           motherlode (PDA), config, mint, token_account (authority
+    ///           ATA), ticket_batch (PDA), token_program, system_program]
+    /// Data: count u64 LE
+    BuyTickets = 22,
+
+    /// Deliver a pending ticket-draw share (permissionless; the crank
+    /// calls it right after a strike). The batch must cover the drawn
+    /// ticket index of the pending epoch; the share moves into the batch
+    /// wallet's Win PDA (created if needed, rent from the payer) exactly
+    /// like a mining strike share, and the batch closes (rent back to the
+    /// batch wallet).
+    /// Accounts: [payer (signer), ticket_state (PDA), ticket_batch (PDA),
+    ///           batch_wallet (writable, = batch.wallet), win (PDA of
+    ///           batch.wallet), system_program]
+    SettleTicketWin = 23,
+
+    /// Close a stale TicketBatch once its epoch is over (rent back to the
+    /// batch wallet; permissionless garbage collection). Refuses while the
+    /// batch's epoch draw is still pending settlement.
+    /// Accounts: [ticket_state (PDA), ticket_batch (PDA, writable),
+    ///           batch_wallet (writable, = batch.wallet)]
+    CloseTicketBatch = 24,
 }
 
 impl MinerInstruction {
@@ -214,6 +249,10 @@ impl MinerInstruction {
             18 => Self::GameClaim,
             19 => Self::GameClaimWin,
             20 => Self::GameCloseRound,
+            21 => Self::InitTickets,
+            22 => Self::BuyTickets,
+            23 => Self::SettleTicketWin,
+            24 => Self::CloseTicketBatch,
             _ => return None,
         })
     }
